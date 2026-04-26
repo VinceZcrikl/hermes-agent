@@ -301,11 +301,16 @@ export default function ProfilesPage() {
                   <SelectOption value="">
                     {t.profiles.cloneSourceBlank}
                   </SelectOption>
-                  {profiles.map((p) => (
-                    <SelectOption key={p.name} value={p.name}>
-                      {p.name}
-                    </SelectOption>
-                  ))}
+                  {/* Wrap the .map() output in a Fragment so the Select's
+                      flattenChildren walks props.children to find these
+                      options — it doesn't recurse into bare arrays. */}
+                  <>
+                    {profiles.map((p) => (
+                      <SelectOption key={p.name} value={p.name}>
+                        {p.name}
+                      </SelectOption>
+                    ))}
+                  </>
                 </Select>
               </div>
 
