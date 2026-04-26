@@ -27,6 +27,11 @@ import { Select, SelectOption } from "@/components/ui/select";
 import { Segmented } from "@/components/ui/segmented";
 import { useI18n } from "@/i18n";
 
+// Mirrors hermes_cli/profiles.py::_PROFILE_ID_RE so we can reject obviously
+// invalid names (uppercase, spaces, …) before round-tripping a doomed
+// PATCH/POST request and burning a toast cycle.
+const PROFILE_NAME_RE = /^[a-z0-9][a-z0-9_-]{0,63}$/;
+
 export default function ProfilesPage() {
   const [profiles, setProfiles] = useState<ProfileInfo[]>([]);
   const [active, setActive] = useState<string>("default");
@@ -139,6 +144,10 @@ export default function ProfilesPage() {
       showToast(t.profiles.nameRequired, "error");
       return;
     }
+    if (!PROFILE_NAME_RE.test(name)) {
+      showToast(`${t.profiles.invalidName}: ${t.profiles.nameRule}`, "error");
+      return;
+    }
     setCreating(true);
     try {
       const hasSource = cloneSource !== "";
@@ -181,6 +190,11 @@ export default function ProfilesPage() {
     if (!target || target === renamingFrom) {
       setRenamingFrom(null);
       setRenameTo("");
+      return;
+    }
+    if (!PROFILE_NAME_RE.test(target)) {
+      // Keep the inline editor open so the user can fix the name in place.
+      showToast(`${t.profiles.invalidName}: ${t.profiles.nameRule}`, "error");
       return;
     }
     try {
@@ -285,7 +299,14 @@ export default function ProfilesPage() {
                 placeholder={t.profiles.namePlaceholder}
                 value={newName}
                 onChange={(e) => setNewName(e.target.value)}
+                aria-invalid={
+                  newName.trim() !== "" &&
+                  !PROFILE_NAME_RE.test(newName.trim())
+                }
               />
+              <p className="text-xs text-muted-foreground">
+                {t.profiles.nameRule}
+              </p>
             </div>
 
             <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
@@ -434,6 +455,11 @@ export default function ProfilesPage() {
                           if (e.key === "Enter") handleRenameSubmit();
                           if (e.key === "Escape") setRenamingFrom(null);
                         }}
+                        aria-invalid={
+                          renameTo.trim() !== "" &&
+                          renameTo.trim() !== p.name &&
+                          !PROFILE_NAME_RE.test(renameTo.trim())
+                        }
                         className="max-w-xs"
                       />
                     ) : (

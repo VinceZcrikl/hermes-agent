@@ -213,6 +213,9 @@ export const zh: Translations = {
     name: "名称",
     namePlaceholder: "例如：work、side-project",
     nameRequired: "名称必填",
+    nameRule:
+      "仅允许小写字母、数字、下划线和短横线；首字符必须是字母或数字；最多 64 个字符。",
+    invalidName: "配置档名称非法",
     cloneSource: "源配置档",
     cloneSourceBlank: "空白配置档",
     copyMode: "复制内容",

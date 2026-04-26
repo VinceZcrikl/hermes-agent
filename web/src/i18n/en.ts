@@ -216,6 +216,9 @@ export const en: Translations = {
     name: "Name",
     namePlaceholder: "e.g. work, side-project",
     nameRequired: "Name is required",
+    nameRule:
+      "Lowercase letters, digits, _ and - only; must start with a letter or digit; up to 64 characters.",
+    invalidName: "Invalid profile name",
     cloneSource: "Source profile",
     cloneSourceBlank: "Blank profile",
     copyMode: "Copy",
