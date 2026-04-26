@@ -172,16 +172,38 @@ export default function ProfilesPage() {
     }
   };
 
+  // Profiles whose gateway-restart request is currently in flight. Drives the
+  // spinner + disabled state on the row's restart button so the user gets
+  // immediate visual feedback even when the toast is missed (the toast
+  // auto-dismisses after 3s, the spinner stays until the post-restart reload
+  // returns).
+  const [restartingNames, setRestartingNames] = useState<Set<string>>(new Set());
+
   const handleRestartGateway = async (name: string) => {
+    setRestartingNames((s) => new Set(s).add(name));
     try {
       await api.restartProfileGateway(name);
       showToast(`${t.profiles.gatewayRestarting}: ${name}`, "success");
-      // Gateway state takes a few seconds to settle; refresh after a short
-      // delay so the "gateway up" badge reflects the new pid.
-      setTimeout(load, 3000);
     } catch (e) {
       showToast(`${t.status.error}: ${e}`, "error");
+      setRestartingNames((s) => {
+        const next = new Set(s);
+        next.delete(name);
+        return next;
+      });
+      return;
     }
+    // Gateway state takes a few seconds to settle; refresh and clear the
+    // spinner once the new pid is visible (or after a hard timeout so we
+    // don't get stuck if the gateway never comes up).
+    setTimeout(() => {
+      load();
+      setRestartingNames((s) => {
+        const next = new Set(s);
+        next.delete(name);
+        return next;
+      });
+    }, 3000);
   };
 
   const handleRenameSubmit = async () => {
@@ -566,9 +588,15 @@ export default function ProfilesPage() {
                         size="icon"
                         title={t.profiles.restartGateway}
                         aria-label={t.profiles.restartGateway}
+                        disabled={restartingNames.has(p.name)}
                         onClick={() => handleRestartGateway(p.name)}
                       >
-                        <RotateCw className="h-4 w-4" />
+                        <RotateCw
+                          className={
+                            "h-4 w-4 " +
+                            (restartingNames.has(p.name) ? "animate-spin" : "")
+                          }
+                        />
                       </Button>
                       <Button
                         variant="ghost"
