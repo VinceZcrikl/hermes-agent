@@ -975,9 +975,16 @@ def rename_profile(old_name: str, new_name: str) -> Path:
     if new_dir.exists():
         raise FileExistsError(f"Profile '{new_name}' already exists.")
 
-    # 1. Stop gateway if running
+    # 1. Tear down the launchd/systemd service unconditionally — gateway.pid
+    #    may be stale (the file's pid is dead but launchd has KeepAlive=true
+    #    and is silently respawning a fresh process under the old profile
+    #    name). If we leave the plist installed and only check pid, that
+    #    runaway process re-bootstraps the old directory after the rename
+    #    and the user sees both names in the listing. _cleanup_gateway_service
+    #    is internally guarded on plist/unit existence, so calling it on
+    #    profiles without a service is a safe no-op.
+    _cleanup_gateway_service(old_name, old_dir)
     if _check_gateway_running(old_dir):
-        _cleanup_gateway_service(old_name, old_dir)
         _stop_gateway_process(old_dir)
 
     # 2. Rename directory

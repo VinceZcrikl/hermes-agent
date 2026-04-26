@@ -673,6 +673,45 @@ class TestNewEndpoints:
         )
         assert resp.status_code == 404
 
+    def test_profiles_rename_always_tears_down_service(self, monkeypatch):
+        """Regression: rename must call ``_cleanup_gateway_service`` even when
+        ``_check_gateway_running`` reports False.
+
+        The pid file can lag behind the launchd state — KeepAlive=true plists
+        silently respawn the process after a crash and the new pid never
+        makes it back into ``gateway.pid``. If rename only tore down the
+        service when ``_check_gateway_running`` returned True, the runaway
+        launchd job would re-bootstrap the old profile name after the
+        directory got renamed away.
+        """
+        import hermes_cli.profiles as profiles_mod
+        calls: list = []
+
+        def _fake_cleanup(name, profile_dir):
+            calls.append((name, str(profile_dir)))
+
+        monkeypatch.setattr(profiles_mod, "_cleanup_gateway_service", _fake_cleanup)
+        # Force the (broken-in-the-wild) "no gateway running" state so we
+        # exercise the bug path the fix targets.
+        monkeypatch.setattr(profiles_mod, "_check_gateway_running", lambda *a, **kw: False)
+        monkeypatch.setattr(profiles_mod, "_stop_gateway_process", lambda *a, **kw: None)
+
+        self.client.post("/api/profiles", json={"name": "stale-pid-prof"})
+
+        resp = self.client.patch(
+            "/api/profiles/stale-pid-prof",
+            json={"new_name": "stale-pid-prof-renamed"},
+        )
+        assert resp.status_code == 200
+
+        assert len(calls) == 1, (
+            "rename_profile must call _cleanup_gateway_service once even when "
+            "the gateway is reported as not running"
+        )
+        assert calls[0][0] == "stale-pid-prof"
+
+        self.client.delete("/api/profiles/stale-pid-prof-renamed")
+
     def test_profiles_activate_and_get_active(self, monkeypatch):
         import hermes_cli.profiles as profiles_mod
         monkeypatch.setattr(profiles_mod, "_cleanup_gateway_service", lambda *a, **kw: None)
