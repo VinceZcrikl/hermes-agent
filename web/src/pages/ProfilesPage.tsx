@@ -478,9 +478,20 @@ export default function ProfilesPage() {
                     {isActive && (
                       <Badge variant="success">{t.profiles.activeBadge}</Badge>
                     )}
-                    {p.gateway_running && (
-                      <Badge variant="outline">{t.profiles.gatewayRunning}</Badge>
-                    )}
+                    <Badge variant={p.gateway_running ? "success" : "outline"}>
+                      <span
+                        aria-hidden
+                        className={
+                          "mr-1 inline-block h-1.5 w-1.5 rounded-full " +
+                          (p.gateway_running
+                            ? "bg-emerald-400"
+                            : "bg-muted-foreground/50")
+                        }
+                      />
+                      {p.gateway_running
+                        ? t.profiles.gatewayRunning
+                        : t.profiles.gatewayStopped}
+                    </Badge>
                     {p.has_env && (
                       <Badge variant="outline">{t.profiles.hasEnv}</Badge>
                     )}

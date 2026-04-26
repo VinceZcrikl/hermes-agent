@@ -240,6 +240,7 @@ export interface Translations {
     defaultBadge: string;
     activeBadge: string;
     gatewayRunning: string;
+    gatewayStopped: string;
     hasEnv: string;
     model: string;
     skills: string;
