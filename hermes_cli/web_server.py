@@ -2102,6 +2102,171 @@ async def delete_cron_job(job_id: str):
 
 
 # ---------------------------------------------------------------------------
+# Profile management endpoints
+# ---------------------------------------------------------------------------
+
+
+class ProfileCreate(BaseModel):
+    name: str
+    clone_from: Optional[str] = None
+    clone_all: bool = False
+    clone_config: bool = False
+    no_alias: bool = False
+
+
+class ProfileRename(BaseModel):
+    new_name: str
+
+
+class ProfileExport(BaseModel):
+    output_path: Optional[str] = None
+
+
+class ProfileImport(BaseModel):
+    archive_path: str
+    name: Optional[str] = None
+
+
+def _profile_to_dict(info) -> Dict[str, Any]:
+    """Serialise a ProfileInfo dataclass to a JSON-friendly dict."""
+    return {
+        "name": info.name,
+        "path": str(info.path),
+        "is_default": info.is_default,
+        "gateway_running": info.gateway_running,
+        "model": info.model,
+        "provider": info.provider,
+        "has_env": info.has_env,
+        "skill_count": info.skill_count,
+        "alias_path": str(info.alias_path) if info.alias_path else None,
+    }
+
+
+@app.get("/api/profiles")
+async def list_profiles_endpoint():
+    from hermes_cli import profiles as profiles_mod
+    active = profiles_mod.get_active_profile()
+    items = [_profile_to_dict(p) for p in profiles_mod.list_profiles()]
+    return {"profiles": items, "active": active}
+
+
+@app.get("/api/profiles/active")
+async def get_active_profile_endpoint():
+    from hermes_cli import profiles as profiles_mod
+    return {"active": profiles_mod.get_active_profile()}
+
+
+@app.post("/api/profiles")
+async def create_profile_endpoint(body: ProfileCreate):
+    from hermes_cli import profiles as profiles_mod
+    try:
+        path = profiles_mod.create_profile(
+            name=body.name,
+            clone_from=body.clone_from,
+            clone_all=body.clone_all,
+            clone_config=body.clone_config,
+            no_alias=body.no_alias,
+        )
+    except (ValueError, FileExistsError, FileNotFoundError) as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        _log.exception("POST /api/profiles failed")
+        raise HTTPException(status_code=500, detail=str(e))
+    return {"ok": True, "name": body.name, "path": str(path)}
+
+
+@app.patch("/api/profiles/{name}")
+async def rename_profile_endpoint(name: str, body: ProfileRename):
+    from hermes_cli import profiles as profiles_mod
+    try:
+        path = profiles_mod.rename_profile(name, body.new_name)
+    except FileNotFoundError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except (ValueError, FileExistsError) as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        _log.exception("PATCH /api/profiles/%s failed", name)
+        raise HTTPException(status_code=500, detail=str(e))
+    return {"ok": True, "name": body.new_name, "path": str(path)}
+
+
+@app.delete("/api/profiles/{name}")
+async def delete_profile_endpoint(name: str):
+    """Delete a profile.
+
+    The dashboard performs the typed-name confirmation in the UI, so the
+    backend always passes ``yes=True`` to skip the CLI's interactive prompt.
+    """
+    from hermes_cli import profiles as profiles_mod
+    try:
+        path = profiles_mod.delete_profile(name, yes=True)
+    except FileNotFoundError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        _log.exception("DELETE /api/profiles/%s failed", name)
+        raise HTTPException(status_code=500, detail=str(e))
+    return {"ok": True, "path": str(path)}
+
+
+@app.post("/api/profiles/{name}/activate")
+async def activate_profile_endpoint(name: str):
+    from hermes_cli import profiles as profiles_mod
+    try:
+        profiles_mod.set_active_profile(name)
+    except (ValueError, FileNotFoundError) as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        _log.exception("POST /api/profiles/%s/activate failed", name)
+        raise HTTPException(status_code=500, detail=str(e))
+    return {"ok": True, "active": name}
+
+
+@app.post("/api/profiles/{name}/export")
+async def export_profile_endpoint(name: str, body: ProfileExport):
+    """Export a profile to a tar.gz archive on the server filesystem.
+
+    ``output_path`` may be omitted; the server then writes to
+    ``$HERMES_HOME/exports/<name>-<timestamp>.tar.gz``.
+    """
+    from hermes_cli import profiles as profiles_mod
+    if body.output_path:
+        output = Path(body.output_path).expanduser()
+    else:
+        ts = time.strftime("%Y%m%d-%H%M%S")
+        exports_dir = get_hermes_home() / "exports"
+        exports_dir.mkdir(parents=True, exist_ok=True)
+        output = exports_dir / f"{name}-{ts}.tar.gz"
+    try:
+        result = profiles_mod.export_profile(name, str(output))
+    except FileNotFoundError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        _log.exception("POST /api/profiles/%s/export failed", name)
+        raise HTTPException(status_code=500, detail=str(e))
+    return {"ok": True, "path": str(result)}
+
+
+@app.post("/api/profiles/import")
+async def import_profile_endpoint(body: ProfileImport):
+    from hermes_cli import profiles as profiles_mod
+    archive = Path(body.archive_path).expanduser()
+    try:
+        path = profiles_mod.import_profile(str(archive), name=body.name)
+    except FileNotFoundError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except (ValueError, FileExistsError) as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        _log.exception("POST /api/profiles/import failed")
+        raise HTTPException(status_code=500, detail=str(e))
+    return {"ok": True, "path": str(path), "name": path.name}
+
+
+# ---------------------------------------------------------------------------
 # Skills & Tools endpoints
 # ---------------------------------------------------------------------------
 

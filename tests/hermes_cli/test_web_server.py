@@ -585,6 +585,114 @@ class TestNewEndpoints:
         resp = self.client.get("/api/cron/jobs/nonexistent-id")
         assert resp.status_code == 404
 
+    # --- Profile management ---
+
+    def test_profiles_list_includes_default(self, monkeypatch):
+        # Create the default home dir so list_profiles() reports it.
+        from hermes_constants import get_hermes_home
+        get_hermes_home().mkdir(parents=True, exist_ok=True)
+
+        resp = self.client.get("/api/profiles")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert "profiles" in data
+        assert "active" in data
+        names = [p["name"] for p in data["profiles"]]
+        assert "default" in names
+        default_entry = next(p for p in data["profiles"] if p["name"] == "default")
+        assert default_entry["is_default"] is True
+
+    def test_profiles_create_and_delete(self, monkeypatch):
+        # Stub gateway service cleanup — it shells out to launchctl/systemctl
+        # which we don't want to invoke from tests.
+        import hermes_cli.profiles as profiles_mod
+        monkeypatch.setattr(profiles_mod, "_cleanup_gateway_service", lambda *a, **kw: None)
+
+        resp = self.client.post("/api/profiles", json={"name": "test-prof"})
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["ok"] is True
+        assert body["name"] == "test-prof"
+
+        listing = self.client.get("/api/profiles").json()
+        assert "test-prof" in [p["name"] for p in listing["profiles"]]
+
+        resp = self.client.delete("/api/profiles/test-prof")
+        assert resp.status_code == 200
+        listing = self.client.get("/api/profiles").json()
+        assert "test-prof" not in [p["name"] for p in listing["profiles"]]
+
+    def test_profiles_create_rejects_default_name(self):
+        resp = self.client.post("/api/profiles", json={"name": "default"})
+        assert resp.status_code == 400
+
+    def test_profiles_create_rejects_invalid_name(self):
+        resp = self.client.post("/api/profiles", json={"name": "Has Spaces"})
+        assert resp.status_code == 400
+
+    def test_profiles_create_rejects_duplicate(self, monkeypatch):
+        import hermes_cli.profiles as profiles_mod
+        monkeypatch.setattr(profiles_mod, "_cleanup_gateway_service", lambda *a, **kw: None)
+
+        first = self.client.post("/api/profiles", json={"name": "dupe-prof"})
+        assert first.status_code == 200
+        second = self.client.post("/api/profiles", json={"name": "dupe-prof"})
+        assert second.status_code == 400
+
+        # Cleanup so the temp dir leaves no residue between tests on this worker.
+        self.client.delete("/api/profiles/dupe-prof")
+
+    def test_profiles_delete_default_forbidden(self):
+        resp = self.client.delete("/api/profiles/default")
+        assert resp.status_code == 400
+
+    def test_profiles_delete_not_found(self):
+        resp = self.client.delete("/api/profiles/does-not-exist")
+        assert resp.status_code == 404
+
+    def test_profiles_rename(self, monkeypatch):
+        import hermes_cli.profiles as profiles_mod
+        monkeypatch.setattr(profiles_mod, "_cleanup_gateway_service", lambda *a, **kw: None)
+
+        self.client.post("/api/profiles", json={"name": "rename-src"})
+        resp = self.client.patch(
+            "/api/profiles/rename-src",
+            json={"new_name": "rename-dst"},
+        )
+        assert resp.status_code == 200
+        names = [p["name"] for p in self.client.get("/api/profiles").json()["profiles"]]
+        assert "rename-src" not in names
+        assert "rename-dst" in names
+
+        self.client.delete("/api/profiles/rename-dst")
+
+    def test_profiles_rename_not_found(self):
+        resp = self.client.patch(
+            "/api/profiles/missing",
+            json={"new_name": "whatever"},
+        )
+        assert resp.status_code == 404
+
+    def test_profiles_activate_and_get_active(self, monkeypatch):
+        import hermes_cli.profiles as profiles_mod
+        monkeypatch.setattr(profiles_mod, "_cleanup_gateway_service", lambda *a, **kw: None)
+
+        self.client.post("/api/profiles", json={"name": "active-test"})
+        resp = self.client.post("/api/profiles/active-test/activate")
+        assert resp.status_code == 200
+        assert resp.json()["active"] == "active-test"
+
+        active = self.client.get("/api/profiles/active").json()
+        assert active["active"] == "active-test"
+
+        # Restore default before deletion so cleanup sees a sane state.
+        self.client.post("/api/profiles/default/activate")
+        self.client.delete("/api/profiles/active-test")
+
+    def test_profiles_activate_unknown(self):
+        resp = self.client.post("/api/profiles/no-such-profile/activate")
+        assert resp.status_code == 400
+
     def test_skills_list(self):
         resp = self.client.get("/api/skills")
         assert resp.status_code == 200

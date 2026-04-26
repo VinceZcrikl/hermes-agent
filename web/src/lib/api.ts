@@ -122,6 +122,60 @@ export const api = {
   deleteCronJob: (id: string) =>
     fetchJSON<{ ok: boolean }>(`/api/cron/jobs/${id}`, { method: "DELETE" }),
 
+  // Profiles
+  getProfiles: () => fetchJSON<ProfilesResponse>("/api/profiles"),
+  getActiveProfile: () =>
+    fetchJSON<{ active: string }>("/api/profiles/active"),
+  createProfile: (body: {
+    name: string;
+    clone_from?: string;
+    clone_all?: boolean;
+    clone_config?: boolean;
+    no_alias?: boolean;
+  }) =>
+    fetchJSON<{ ok: boolean; name: string; path: string }>("/api/profiles", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    }),
+  renameProfile: (name: string, newName: string) =>
+    fetchJSON<{ ok: boolean; name: string; path: string }>(
+      `/api/profiles/${encodeURIComponent(name)}`,
+      {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ new_name: newName }),
+      },
+    ),
+  deleteProfile: (name: string) =>
+    fetchJSON<{ ok: boolean; path: string }>(
+      `/api/profiles/${encodeURIComponent(name)}`,
+      { method: "DELETE" },
+    ),
+  activateProfile: (name: string) =>
+    fetchJSON<{ ok: boolean; active: string }>(
+      `/api/profiles/${encodeURIComponent(name)}/activate`,
+      { method: "POST" },
+    ),
+  exportProfile: (name: string, outputPath?: string) =>
+    fetchJSON<{ ok: boolean; path: string }>(
+      `/api/profiles/${encodeURIComponent(name)}/export`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ output_path: outputPath ?? null }),
+      },
+    ),
+  importProfile: (archivePath: string, name?: string) =>
+    fetchJSON<{ ok: boolean; path: string; name: string }>(
+      "/api/profiles/import",
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ archive_path: archivePath, name: name ?? null }),
+      },
+    ),
+
   // Skills & Toolsets
   getSkills: () => fetchJSON<SkillInfo[]>("/api/skills"),
   toggleSkill: (name: string, enabled: boolean) =>
@@ -368,6 +422,23 @@ export interface AnalyticsResponse {
     summary: AnalyticsSkillsSummary;
     top_skills: AnalyticsSkillEntry[];
   };
+}
+
+export interface ProfileInfo {
+  name: string;
+  path: string;
+  is_default: boolean;
+  gateway_running: boolean;
+  model: string | null;
+  provider: string | null;
+  has_env: boolean;
+  skill_count: number;
+  alias_path: string | null;
+}
+
+export interface ProfilesResponse {
+  profiles: ProfileInfo[];
+  active: string;
 }
 
 export interface CronJob {

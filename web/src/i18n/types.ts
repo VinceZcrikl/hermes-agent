@@ -74,6 +74,7 @@ export interface Translations {
       documentation: string;
       keys: string;
       logs: string;
+      profiles: string;
       sessions: string;
       skills: string;
     };
@@ -211,6 +212,47 @@ export interface Translations {
       slack: string;
       email: string;
     };
+  };
+
+  // ── Profiles page ──
+  profiles: {
+    newProfile: string;
+    name: string;
+    namePlaceholder: string;
+    nameRequired: string;
+    cloneFrom: string;
+    cloneFromNone: string;
+    cloneMode: string;
+    cloneModeNone: string;
+    cloneModeConfig: string;
+    cloneModeAll: string;
+    importTitle: string;
+    importAction: string;
+    archivePath: string;
+    archivePathPlaceholder: string;
+    archivePathRequired: string;
+    importNameOptional: string;
+    importNamePlaceholder: string;
+    allProfiles: string;
+    noProfiles: string;
+    onlyDefaultHint: string;
+    defaultBadge: string;
+    activeBadge: string;
+    gatewayRunning: string;
+    hasEnv: string;
+    model: string;
+    skills: string;
+    activate: string;
+    rename: string;
+    exportAction: string;
+    confirmDeleteTitle: string;
+    confirmDeleteMessage: string;
+    created: string;
+    deleted: string;
+    renamed: string;
+    activated: string;
+    exported: string;
+    imported: string;
   };
 
   // ── Skills page ──
