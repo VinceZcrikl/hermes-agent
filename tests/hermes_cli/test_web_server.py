@@ -874,6 +874,54 @@ class TestNewEndpoints:
 
         self.client.delete("/api/profiles/restart-prof")
 
+    def test_profile_gateway_restart_strips_exclusive_tokens_from_env(self, monkeypatch):
+        """Spawned per-profile gateway must not inherit Weixin/Telegram/Discord
+        tokens from the dashboard's own process env.
+
+        The dashboard loads its HERMES_HOME's .env at boot, so its
+        ``os.environ`` carries that profile's bot credentials. Without
+        stripping, every spawned ``hermes gateway restart --profile X`` for
+        a *different* X would pick up those credentials and crash on the
+        platform-lock acquisition (or worse, hijack a token that legitimately
+        belongs to a different profile).
+        """
+        import hermes_cli.profiles as profiles_mod
+        import hermes_cli.web_server as web_server
+        monkeypatch.setattr(profiles_mod, "_cleanup_gateway_service", lambda *a, **kw: None)
+
+        # Simulate the dashboard process having default-profile tokens in
+        # its environment.
+        monkeypatch.setenv("WEIXIN_TOKEN", "leaked-weixin-token-from-default")
+        monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "leaked-telegram-token")
+        monkeypatch.setenv("DISCORD_BOT_TOKEN", "leaked-discord-token")
+        monkeypatch.setenv("OPENROUTER_API_KEY", "should-pass-through-fine")
+
+        captured: dict = {}
+
+        class _FakePopen:
+            def __init__(self, cmd, **kwargs):
+                captured["env"] = kwargs.get("env", {})
+                self.pid = 99999
+
+        monkeypatch.setattr(web_server.subprocess, "Popen", _FakePopen)
+
+        self.client.post("/api/profiles", json={"name": "leak-test-prof"})
+        resp = self.client.post("/api/profiles/leak-test-prof/gateway/restart")
+        assert resp.status_code == 200
+
+        env = captured["env"]
+        assert "WEIXIN_TOKEN" not in env
+        assert "TELEGRAM_BOT_TOKEN" not in env
+        assert "DISCORD_BOT_TOKEN" not in env
+        # Non-exclusive vars (LLM API keys, PATH, …) must still pass through
+        # so the spawned interpreter can find dependencies.
+        assert env.get("OPENROUTER_API_KEY") == "should-pass-through-fine"
+        assert env.get("HERMES_HOME") == str(
+            profiles_mod.get_profile_dir("leak-test-prof")
+        )
+
+        self.client.delete("/api/profiles/leak-test-prof")
+
     def test_profile_gateway_restart_unknown_404(self):
         resp = self.client.post("/api/profiles/no-such-profile/gateway/restart")
         assert resp.status_code == 404

@@ -2417,7 +2417,19 @@ def _spawn_per_profile_gateway_restart(profile_dir: Path) -> subprocess.Popen:
     )
 
     cmd = [sys.executable, "-m", "hermes_cli.main", "gateway", "restart"]
-    env = {**os.environ, "HERMES_HOME": str(profile_dir), "HERMES_NONINTERACTIVE": "1"}
+    # Strip exclusive bot-credential env vars from the inherited environment.
+    # The dashboard's own process loaded them from its HERMES_HOME's .env at
+    # boot, and ``{**os.environ}`` would otherwise shovel them into every
+    # spawned per-profile gateway — locking the target profile out of any
+    # platform whose token actually lives in the dashboard's profile. Let
+    # the child reload only what its own .env supplies.
+    env = {
+        k: v
+        for k, v in os.environ.items()
+        if k not in _EXCLUSIVE_TOKEN_ENV_KEYS
+    }
+    env["HERMES_HOME"] = str(profile_dir)
+    env["HERMES_NONINTERACTIVE"] = "1"
 
     popen_kwargs: Dict[str, Any] = {
         "cwd": str(PROJECT_ROOT),
