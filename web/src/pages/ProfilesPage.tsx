@@ -225,6 +225,16 @@ export default function ProfilesPage() {
       }
       if (polls >= MAX_POLLS) {
         clearSpinner();
+        // Spawn returned 200 but the gateway never reported running. Most
+        // commonly this is a startup conflict — Weixin/Telegram token in
+        // use by another profile, missing optional dependency, missing API
+        // keys, or a port collision. Point the user at the log instead of
+        // silently clearing the spinner so it doesn't look like nothing
+        // happened.
+        showToast(
+          `${t.profiles.gatewayDidNotStart}: ${name} — ${t.profiles.checkLog}`,
+          "error",
+        );
         return;
       }
       setTimeout(poll, POLL_INTERVAL);

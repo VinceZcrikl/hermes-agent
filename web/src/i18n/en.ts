@@ -266,6 +266,8 @@ export const en: Translations = {
     imported: "Imported",
     soulSaved: "SOUL.md saved",
     modelSaved: "Model saved",
+    gatewayDidNotStart: "Gateway did not come up",
+    checkLog: "check logs/gateway-restart.log",
   },
 
   skills: {

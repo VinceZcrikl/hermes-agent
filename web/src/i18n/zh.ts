@@ -262,6 +262,8 @@ export const zh: Translations = {
     imported: "已导入",
     soulSaved: "SOUL.md 已保存",
     modelSaved: "模型已保存",
+    gatewayDidNotStart: "网关未能启动",
+    checkLog: "查看 logs/gateway-restart.log",
   },
 
   skills: {

@@ -267,6 +267,8 @@ export interface Translations {
     imported: string;
     soulSaved: string;
     modelSaved: string;
+    gatewayDidNotStart: string;
+    checkLog: string;
   };
 
   // ── Skills page ──
