@@ -18,6 +18,10 @@ function setSessionHeader(headers: Headers, token: string): void {
   }
 }
 
+// Tracks whether we've already triggered a reload-to-refresh-session flow so
+// repeated 401s in a single tab don't ping-pong reload forever.
+let _sessionReloadTriggered = false;
+
 export async function fetchJSON<T>(url: string, init?: RequestInit): Promise<T> {
   // Inject the session token into all /api/ requests.
   const headers = new Headers(init?.headers);
@@ -27,6 +31,16 @@ export async function fetchJSON<T>(url: string, init?: RequestInit): Promise<T> 
   }
   const res = await fetch(`${BASE}${url}`, { ...init, headers });
   if (!res.ok) {
+    if (res.status === 401 && !_sessionReloadTriggered) {
+      // The dashboard server rotates _SESSION_TOKEN on every restart and
+      // injects it into the SPA HTML. If we hit 401, our cached token is
+      // almost certainly stale (the server got restarted while this tab
+      // stayed open). Reload once to pick up the freshly-injected token.
+      _sessionReloadTriggered = true;
+      window.location.reload();
+      // Block this request indefinitely; the reload will tear it down.
+      return new Promise<T>(() => {});
+    }
     const text = await res.text().catch(() => res.statusText);
     throw new Error(`${res.status}: ${text}`);
   }
