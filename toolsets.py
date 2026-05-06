@@ -65,6 +65,8 @@ _HERMES_CORE_TOOLS = [
     # zero schema footprint. Gated via check_fn in tools/kanban_tools.py.
     "kanban_show", "kanban_complete", "kanban_block", "kanban_heartbeat",
     "kanban_comment", "kanban_create", "kanban_link",
+    "kanban_list_profiles", "kanban_propose_profile",
+    "kanban_provision_profile",
 ]
 
 
@@ -227,6 +229,8 @@ TOOLSETS = {
             "kanban_show", "kanban_complete", "kanban_block",
             "kanban_heartbeat", "kanban_comment",
             "kanban_create", "kanban_link",
+            "kanban_list_profiles", "kanban_propose_profile",
+            "kanban_provision_profile",
         ],
         "includes": [],
     },

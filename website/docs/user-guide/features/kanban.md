@@ -242,6 +242,9 @@ hermes kanban block    t_abc "need input" --ids t_def t_hij
 | `kanban_comment` | Append a durable note to the task thread. | `task_id`, `body` |
 | `kanban_create` | (Orchestrators) fan out into child tasks with an `assignee`, optional `parents`, `skills`, etc. | `title`, `assignee` |
 | `kanban_link` | (Orchestrators) add a `parent_id → child_id` dependency edge after the fact. | `parent_id`, `child_id` |
+| `kanban_list_profiles` | (Team builder) read the live profile roster + per-profile task counts before deciding whether to propose a new profile. | — |
+| `kanban_propose_profile` | (Team builder) validate a proposed profile design (name, role, description, base, skills, toolsets, model) and write a `profile.proposed` event. Does NOT create the profile. | `name`, `role`, `description` |
+| `kanban_provision_profile` | (Team builder) materialize an approved proposal on disk and link it to the parent task's `created_profiles` audit trail. Hard-fuses on `profile_provisioning='off'`. | one of `proposal_event_id` or `inline.name` |
 
 A typical worker turn looks like:
 
@@ -291,6 +294,75 @@ Three reasons:
 **Zero schema footprint on normal sessions.** A regular `hermes chat` session has zero `kanban_*` tools in its schema. The `check_fn` on each tool only returns True when `HERMES_KANBAN_TASK` is set, which only happens when the dispatcher spawned this process. No tool bloat for users who never touch kanban.
 
 The `kanban-worker` and `kanban-orchestrator` skills teach the model which tool to call when and in what order.
+
+## Auto team building
+
+When you create a task with an `assignee` that does not match an existing profile, the dispatcher's behavior depends on the **profile provisioning** setting in the kanban dashboard:
+
+| Mode | Behavior on missing assignee |
+|---|---|
+| `manual` (default) | The dispatcher emits a `profile.required` event; the dashboard surfaces a card for human approval. |
+| `off` (legacy) | The dispatcher silently skips the task (`skipped_nonspawnable`). The operator must reassign the task or create the profile by hand. |
+| `auto` | The dispatcher rewrites the task's assignee to the bundled `team-builder` profile, which uses the `kanban-team-builder` skill to design and provision profiles for the original role automatically. |
+
+### Toggling the mode
+
+The dashboard exposes the switch under **Settings → Profile provisioning**. The endpoint is also reachable directly:
+
+```bash
+# Read the current mode
+curl http://localhost:<port>/api/plugins/kanban/settings/profile-provisioning
+
+# Switch to auto (transactional: installs kanban-team-builder skill +
+# creates team-builder profile if missing, then persists the setting).
+curl -X PATCH \
+  -H "Content-Type: application/json" \
+  -d '{"value": "auto"}' \
+  http://localhost:<port>/api/plugins/kanban/settings/profile-provisioning
+```
+
+The PATCH endpoint runs the auto-mode bootstrap as a single transaction:
+
+1. Probe `~/.hermes/skills/kanban-team-builder/SKILL.md`. If absent, install it from the bundled `optional-skills/devops/kanban-team-builder/` source.
+2. Probe `~/.hermes/profiles/team-builder/`. If absent, clone it from `default`. The dispatcher injects `kanban-team-builder` into `tasks.skills` whenever it routes a task to this profile, so the skill loads via the existing `--skills` mechanism — no profile-level skill auto-load needed.
+3. Persist the setting.
+
+Any step failure aborts the toggle — the previous setting is preserved and a `409` is returned with the error chain. Repeated PATCH calls are idempotent.
+
+### What the team-builder profile does
+
+When `auto` mode is active and the dispatcher rewrites an assignee, the spawned `team-builder` worker runs this workflow (driven by the `kanban-team-builder` skill):
+
+1. **Read the requirement** — `kanban_show()` retrieves the task; the `profile.required` event holds the original assignee as a role hint.
+2. **Pull the roster** — `kanban_list_profiles()` returns every profile + role + loaded skills + toolsets + per-profile task counts.
+3. **Decide reuse vs. clone vs. create** per candidate role. The skill's prompt biases toward reuse: only create when no existing profile is within editing distance.
+4. **Propose** every `create` / `clone` decision through `kanban_propose_profile`. The tool runs hard checks (name validity, alias collision, duplicate profile) and writes a `profile.proposed` event.
+5. **Provision** approved proposals through `kanban_provision_profile`. In `auto` mode this happens immediately. In `manual` mode the team-builder stops here and waits for a dashboard approval; the parent task records every proposal so the human can review and approve from the UI.
+6. **Fan out** child tasks under the new (or reused) profiles using `kanban_create`. The dispatcher takes over from there.
+
+Every provisioned profile is recorded on the parent task's `created_profiles` JSON column for audit and reverse-lookup ("which task spawned profile X?").
+
+### Approving / rejecting proposals from the dashboard
+
+In `manual` mode (or when an `auto`-mode worker is in `manual` mode for a specific board), the dashboard exposes:
+
+```
+GET  /api/plugins/kanban/profiles/proposals?status=pending
+POST /api/plugins/kanban/profiles/proposals/{event_id}/approve
+POST /api/plugins/kanban/profiles/proposals/{event_id}/reject  body: {"reason": "..."}
+```
+
+Approval triggers the same `create_profile` + `seed_profile_skills` path the agent tool uses; rejection writes a `profile.rejected` event and posts a comment on the parent task with the reason.
+
+### Compatibility envelope
+
+| State | What changes after upgrade |
+|---|---|
+| Default `manual` + skill not installed | Tasks with missing assignees emit `profile.required` cards instead of disappearing. The skill is irrelevant — humans drive the approval flow. |
+| `off` | Identical to pre-feature behavior. Set this if you need byte-for-byte legacy semantics. |
+| `auto` | Cannot be set without the skill / team-builder profile in place — the PATCH endpoint installs them transactionally before persisting. |
+
+The `kanban_provision_profile` tool itself hard-fuses on `profile_provisioning='off'`, so a hallucinating worker LLM cannot create profiles even if the tool ends up in its schema.
 
 ### Recommended handoff evidence
 

@@ -1007,6 +1007,14 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
         # worker (additive to the built-in `kanban-worker`). NULL is fine
         # for existing rows.
         conn.execute("ALTER TABLE tasks ADD COLUMN skills TEXT")
+    if "created_profiles" not in cols:
+        # JSON array of profile descriptors the team-builder workflow
+        # provisioned while running this task:
+        # ``[{"name", "role", "base", "created_at", "created_by_run"}, ...]``.
+        # NULL on legacy rows; readers normalize to ``[]``. Used for
+        # reverse lookup ("which task spawned profile X?") and dashboard
+        # visualizations of team composition over time.
+        conn.execute("ALTER TABLE tasks ADD COLUMN created_profiles TEXT")
 
     # task_events gained a run_id column; back-fill it as NULL for
     # historical events (they predate runs and can't be attributed).
@@ -2545,6 +2553,282 @@ def set_workspace_path(
 
 
 # ---------------------------------------------------------------------------
+# Auto-team profile provisioning helpers
+# ---------------------------------------------------------------------------
+
+# Profile name used by the dispatcher in ``auto`` mode to take ownership of
+# tasks whose original assignee does not resolve to a real profile. The
+# ``team-builder`` profile is provisioned (cloned from ``default``) by the
+# dashboard PATCH endpoint when the operator first toggles the setting to
+# ``auto``. The ``kanban-team-builder`` skill is loaded into spawned
+# workers via the existing ``--skills`` mechanism: when the dispatcher
+# rewrites a task's assignee to ``team-builder`` it also injects
+# ``kanban-team-builder`` into ``tasks.skills`` so ``_default_spawn``
+# passes it to the worker (Hermes has no profile-level auto-load
+# config — see ``rewrite_assignee_for_team_builder``).
+TEAM_BUILDER_PROFILE = "team-builder"
+
+# Allowed values for ``dashboard.kanban.profile_provisioning``.
+PROVISIONING_OFF = "off"
+PROVISIONING_MANUAL = "manual"
+PROVISIONING_AUTO = "auto"
+PROVISIONING_VALUES = (PROVISIONING_OFF, PROVISIONING_MANUAL, PROVISIONING_AUTO)
+
+# Default mode when the setting is absent. ``manual`` surfaces tasks with
+# missing assignees as ``profile.required`` cards in the dashboard rather
+# than silently skipping them. Operators wanting strict legacy behavior set
+# the value to ``off`` explicitly.
+PROVISIONING_DEFAULT = PROVISIONING_MANUAL
+
+
+def read_profile_provisioning_setting() -> str:
+    """Return the active ``profile_provisioning`` mode.
+
+    Reads ``dashboard.kanban.profile_provisioning`` from the global
+    Hermes config. Falls back to ``PROVISIONING_DEFAULT`` (``manual``)
+    when the key is absent or the file is unreadable. An unrecognized
+    value also degrades to the default — we'd rather emit a card than
+    swallow a task because someone misspelled the setting.
+    """
+    try:
+        from hermes_cli.config import load_config
+        cfg = load_config() or {}
+    except Exception:
+        return PROVISIONING_DEFAULT
+    dash = (cfg.get("dashboard") or {})
+    k = dash.get("kanban") or {}
+    val = (k.get("profile_provisioning") or "").strip().lower()
+    if val in PROVISIONING_VALUES:
+        return val
+    return PROVISIONING_DEFAULT
+
+
+def record_created_profile(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    profile_name: str,
+    role: Optional[str] = None,
+    base: Optional[str] = None,
+    run_id: Optional[int] = None,
+) -> None:
+    """Append a created-profile descriptor to the task's ``created_profiles`` JSON.
+
+    Called by ``kanban_provision_profile`` after the on-disk profile is
+    created so the parent task carries a forward audit trail. Idempotent
+    on (task_id, profile_name) — a second call updates ``role``/``base``
+    in place rather than producing a duplicate entry, which lets retries
+    after partial failure converge cleanly.
+    """
+    with write_txn(conn):
+        row = conn.execute(
+            "SELECT created_profiles FROM tasks WHERE id = ?", (task_id,),
+        ).fetchone()
+        if not row:
+            raise ValueError(f"unknown task: {task_id}")
+        raw = row["created_profiles"]
+        try:
+            entries = json.loads(raw) if raw else []
+        except Exception:
+            entries = []
+        if not isinstance(entries, list):
+            entries = []
+        entry = {
+            "name": profile_name,
+            "role": role,
+            "base": base,
+            "created_at": int(time.time()),
+            "created_by_run": run_id,
+        }
+        replaced = False
+        for i, e in enumerate(entries):
+            if isinstance(e, dict) and e.get("name") == profile_name:
+                entries[i] = entry
+                replaced = True
+                break
+        if not replaced:
+            entries.append(entry)
+        conn.execute(
+            "UPDATE tasks SET created_profiles = ? WHERE id = ?",
+            (json.dumps(entries, ensure_ascii=False), task_id),
+        )
+
+
+def find_tasks_by_created_profile(
+    conn: sqlite3.Connection, profile_name: str,
+) -> list[dict]:
+    """Return tasks whose ``created_profiles`` includes a given profile name.
+
+    Used by doctor / dashboard to answer "which task created profile X?"
+    and to detect orphaned profiles (no task remembers having created
+    them — usually fine, sometimes worth surfacing to humans).
+
+    The implementation scans ``created_profiles`` in Python rather than
+    in SQL because SQLite's JSON1 extension isn't guaranteed across all
+    bundled distributions. Volume is small (one row per provisioning
+    action over the project's lifetime), so a full scan is cheap.
+    """
+    needle = profile_name.strip().lower()
+    out: list[dict] = []
+    cur = conn.execute(
+        "SELECT id, title, status, assignee, created_profiles "
+        "FROM tasks WHERE created_profiles IS NOT NULL"
+    )
+    for row in cur:
+        try:
+            entries = json.loads(row["created_profiles"])
+        except Exception:
+            continue
+        if not isinstance(entries, list):
+            continue
+        for e in entries:
+            if isinstance(e, dict) and (e.get("name") or "").strip().lower() == needle:
+                out.append({
+                    "id": row["id"],
+                    "title": row["title"],
+                    "status": row["status"],
+                    "assignee": row["assignee"],
+                    "entry": e,
+                })
+                break
+    return out
+
+
+def rewrite_assignee_for_team_builder(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    original_assignee: str,
+) -> bool:
+    """Atomically rewrite a task's ``assignee`` to the team-builder profile.
+
+    Used by the dispatcher in ``auto`` mode when the original assignee
+    does not resolve to a real profile. Records a ``profile.required``
+    event with the original assignee so the team-builder worker can
+    learn what role it needs to design for. Also merges
+    ``kanban-team-builder`` into the task's ``skills`` JSON column so
+    the dispatcher passes ``--skills kanban-team-builder`` to the
+    spawned worker (Hermes loads preloaded skills via the CLI flag,
+    not via a profile-level config field — see ``_default_spawn``).
+    Returns ``True`` if the rewrite happened, ``False`` if the task
+    already carries the team-builder assignee (idempotent on retries
+    / racing dispatchers).
+    """
+    with write_txn(conn):
+        row = conn.execute(
+            "SELECT assignee, skills FROM tasks WHERE id = ?", (task_id,),
+        ).fetchone()
+        if not row:
+            return False
+        if row["assignee"] == TEAM_BUILDER_PROFILE:
+            return False
+        try:
+            existing_skills = json.loads(row["skills"]) if row["skills"] else []
+        except Exception:
+            existing_skills = []
+        if not isinstance(existing_skills, list):
+            existing_skills = []
+        merged_skills = list(existing_skills)
+        if "kanban-team-builder" not in merged_skills:
+            merged_skills.append("kanban-team-builder")
+        conn.execute(
+            "UPDATE tasks SET assignee = ?, skills = ? WHERE id = ?",
+            (
+                TEAM_BUILDER_PROFILE,
+                json.dumps(merged_skills, ensure_ascii=False),
+                task_id,
+            ),
+        )
+        _append_event(
+            conn, task_id, "profile.required",
+            {
+                "mode": PROVISIONING_AUTO,
+                "original_assignee": original_assignee,
+                "rewritten_to": TEAM_BUILDER_PROFILE,
+            },
+        )
+    return True
+
+
+def append_event(
+    conn: sqlite3.Connection,
+    task_id: str,
+    kind: str,
+    payload: Optional[dict] = None,
+    *,
+    run_id: Optional[int] = None,
+) -> int:
+    """Public wrapper: append a custom event row inside its own write_txn.
+
+    Most internal call-sites use ``_append_event`` while inside a wider
+    transaction. Tool handlers and plugin endpoints want a self-contained
+    write that returns the new event id, which this provides. Returns
+    the auto-incremented ``task_events.id`` of the inserted row.
+    """
+    with write_txn(conn):
+        _append_event(conn, task_id, kind, payload, run_id=run_id)
+        row = conn.execute(
+            "SELECT id FROM task_events WHERE task_id = ? AND kind = ? "
+            "ORDER BY id DESC LIMIT 1",
+            (task_id, kind),
+        ).fetchone()
+    return int(row["id"]) if row else 0
+
+
+def latest_event_payload(
+    conn: sqlite3.Connection, task_id: str, kind: str,
+) -> Optional[dict]:
+    """Read the payload of the most recent event of *kind* on *task_id*.
+
+    Used by the team-builder workflow + dashboard to retrieve
+    ``profile.required`` originals, current proposal state, etc.
+    Returns ``None`` when no event of that kind exists.
+    """
+    row = conn.execute(
+        "SELECT payload FROM task_events WHERE task_id = ? AND kind = ? "
+        "ORDER BY id DESC LIMIT 1",
+        (task_id, kind),
+    ).fetchone()
+    if not row or not row["payload"]:
+        return None
+    try:
+        return json.loads(row["payload"])
+    except Exception:
+        return None
+
+
+def emit_profile_required_for_manual(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    original_assignee: str,
+) -> bool:
+    """Emit a single ``profile.required`` event for a manual-mode task.
+
+    Idempotent: subsequent dispatcher ticks see the existing event and
+    skip emission, which prevents the manual mode from spamming the
+    event log every tick while the task waits for a human to approve a
+    profile. Returns ``True`` when the event was newly emitted.
+    """
+    with write_txn(conn):
+        existing = conn.execute(
+            "SELECT 1 FROM task_events WHERE task_id = ? AND kind = 'profile.required' "
+            "ORDER BY id DESC LIMIT 1",
+            (task_id,),
+        ).fetchone()
+        if existing:
+            return False
+        _append_event(
+            conn, task_id, "profile.required",
+            {
+                "mode": PROVISIONING_MANUAL,
+                "original_assignee": original_assignee,
+            },
+        )
+    return True
+
+
+# ---------------------------------------------------------------------------
 # Dispatcher (one-shot pass)
 # ---------------------------------------------------------------------------
 
@@ -3183,9 +3467,37 @@ def dispatch_once(
         except Exception:
             profile_exists = None  # type: ignore[assignment]
         if profile_exists is not None and not profile_exists(row["assignee"]):
-            # Bucket separately from skipped_unassigned: the operator
-            # cannot fix this by assigning a profile (the assignee IS the
-            # intended owner — a terminal lane). Health telemetry uses
+            # The auto-team feature can recover some of these tasks: when
+            # the operator opted into ``manual`` or ``auto`` provisioning,
+            # the dispatcher emits a ``profile.required`` event (manual)
+            # or rewrites the assignee to ``team-builder`` (auto) so the
+            # task can still make progress. ``off`` keeps strict legacy
+            # behavior — the task is bucketed as nonspawnable and the
+            # operator must assign a real profile manually.
+            mode = read_profile_provisioning_setting()
+            original_assignee = row["assignee"]
+            if mode == PROVISIONING_AUTO and profile_exists(TEAM_BUILDER_PROFILE):
+                # Rewrite in place; the same tick will see the new
+                # assignee on the next iteration of the ready loop only
+                # if we re-fetch, but we're already past this row. The
+                # rewritten task is picked up on the *next* dispatcher
+                # tick, which keeps the auto-promotion racy-free with
+                # multiple gateway dispatchers.
+                if rewrite_assignee_for_team_builder(
+                    conn, row["id"], original_assignee=original_assignee,
+                ):
+                    # Counted as nonspawnable for this tick — the rewrite
+                    # applies on the next tick once the row is refetched.
+                    result.skipped_nonspawnable.append(row["id"])
+                    continue
+            elif mode == PROVISIONING_MANUAL:
+                emit_profile_required_for_manual(
+                    conn, row["id"], original_assignee=original_assignee,
+                )
+            # ``off``, or ``auto`` without a provisioned team-builder
+            # profile (operator hasn't completed the dashboard toggle),
+            # or the team-builder profile is the unspawnable one itself
+            # — fall through to the legacy bucket. Health telemetry uses
             # this distinction to suppress spurious "stuck" warnings on
             # multi-lane setups where the ready queue is steadily full
             # of human-pulled work.

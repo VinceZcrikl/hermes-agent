@@ -464,6 +464,394 @@ def _handle_link(args: dict, **kw) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Auto-team profile provisioning handlers
+# ---------------------------------------------------------------------------
+
+def _read_profile_config(profile_dir) -> dict:
+    """Read a profile's ``config.yaml`` lazily; return ``{}`` on any error.
+
+    Used by ``kanban_list_profiles`` to surface role / description /
+    toolsets / skills metadata so the team-builder LLM can decide
+    reuse vs create without a second tool call per profile.
+    """
+    cfg_path = profile_dir / "config.yaml"
+    if not cfg_path.exists():
+        return {}
+    try:
+        import yaml
+        with open(cfg_path, "r") as f:
+            return yaml.safe_load(f) or {}
+    except Exception:
+        return {}
+
+
+def _handle_list_profiles(args: dict, **kw) -> str:
+    """Return the live profile roster + per-profile task counts.
+
+    Used by the team-builder skill before deciding whether to propose
+    a new profile or reuse an existing one. The response is intentionally
+    structured so the LLM can scan roles in O(N): each entry exposes
+    ``{name, role, description, skills, toolsets, model, task_counts}``.
+    """
+    try:
+        from hermes_cli.profiles import list_profiles
+    except Exception as e:
+        return tool_error(f"kanban_list_profiles: {e}")
+    try:
+        kb, conn = _connect()
+    except Exception as e:
+        return tool_error(f"kanban_list_profiles: {e}")
+    try:
+        # Per-profile open / running / done counts in a single pass.
+        counts: dict[str, dict[str, int]] = {}
+        cur = conn.execute(
+            "SELECT assignee, status, COUNT(*) AS n "
+            "FROM tasks WHERE assignee IS NOT NULL "
+            "GROUP BY assignee, status"
+        )
+        for row in cur:
+            bucket = counts.setdefault(row["assignee"], {"open": 0, "running": 0, "done": 0})
+            st = row["status"]
+            if st == "running":
+                bucket["running"] += int(row["n"])
+            elif st in ("done", "archived"):
+                bucket["done"] += int(row["n"])
+            else:
+                bucket["open"] += int(row["n"])
+
+        profiles = []
+        for p in list_profiles():
+            cfg = _read_profile_config(p.path)
+            entry = {
+                "name": p.name,
+                "is_default": p.is_default,
+                "model": p.model,
+                "provider": p.provider,
+                # Number of installed skills under <profile>/skills/.
+                # The team-builder skill keys reuse-vs-create on roster
+                # similarity, not on this number; it's surfaced for
+                # operator dashboards.
+                "skill_count": p.skill_count,
+                "role": cfg.get("role"),
+                "description": cfg.get("description") or cfg.get("about"),
+                "toolsets": cfg.get("toolsets") or [],
+                "task_counts": counts.get(p.name, {"open": 0, "running": 0, "done": 0}),
+            }
+            profiles.append(entry)
+        return _ok(profiles=profiles)
+    except Exception as e:
+        logger.exception("kanban_list_profiles failed")
+        return tool_error(f"kanban_list_profiles: {e}")
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+def _handle_propose_profile(args: dict, **kw) -> str:
+    """Validate a proposed profile design and write a ``profile.proposed`` event.
+
+    Performs the hard checks (name validity, alias collision, duplicate
+    profile) but does NOT create anything on disk. The returned
+    ``proposal_event_id`` is what ``kanban_provision_profile`` (or the
+    dashboard approve endpoint) keys off when the operator chooses to
+    materialize the proposal. ``requires_human_approval`` reflects the
+    current dashboard ``profile_provisioning`` mode so the LLM knows
+    whether to call ``kanban_provision_profile`` itself or wait.
+    """
+    name = (args.get("name") or "").strip()
+    role = (args.get("role") or "").strip()
+    description = (args.get("description") or "").strip()
+    base = (args.get("base") or "").strip() or None
+    skills = args.get("skills") or []
+    toolsets = args.get("toolsets") or []
+    model = (args.get("model") or "").strip() or None
+    if not name:
+        return tool_error("name is required")
+    if not role:
+        return tool_error("role is required")
+    if not description:
+        return tool_error("description is required (1-3 sentences)")
+
+    try:
+        from hermes_cli.profiles import (
+            normalize_profile_name, validate_profile_name,
+            profile_exists, check_alias_collision,
+        )
+    except Exception as e:
+        return tool_error(f"kanban_propose_profile: {e}")
+
+    canon = normalize_profile_name(name)
+    conflicts: list[dict] = []
+    try:
+        validate_profile_name(canon)
+    except ValueError as e:
+        conflicts.append({"kind": "invalid_name", "detail": str(e)})
+    if profile_exists(canon):
+        conflicts.append({
+            "kind": "profile_exists",
+            "detail": f"profile '{canon}' already exists; reuse instead of proposing.",
+        })
+    alias_msg = check_alias_collision(canon)
+    if alias_msg:
+        conflicts.append({"kind": "alias_collision", "detail": alias_msg})
+
+    tid = _default_task_id(args.get("task_id"))
+    if not tid:
+        return tool_error("task_id is required (or set HERMES_KANBAN_TASK in the env)")
+
+    try:
+        kb, conn = _connect()
+    except Exception as e:
+        return tool_error(f"kanban_propose_profile: {e}")
+    try:
+        mode = kb.read_profile_provisioning_setting()
+        payload = {
+            "name": canon,
+            "role": role,
+            "description": description,
+            "base": base,
+            "skills": list(skills),
+            "toolsets": list(toolsets),
+            "model": model,
+            "conflicts": conflicts,
+            "ok": not conflicts,
+        }
+        run_id = _worker_run_id(tid)
+        event_id = kb.append_event(conn, tid, "profile.proposed", payload, run_id=run_id)
+        return _ok(
+            proposal_event_id=int(event_id),
+            ok=not conflicts,
+            conflicts=conflicts,
+            requires_human_approval=(mode == kb.PROVISIONING_MANUAL),
+            mode=mode,
+        )
+    except Exception as e:
+        logger.exception("kanban_propose_profile failed")
+        return tool_error(f"kanban_propose_profile: {e}")
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+def _handle_provision_profile(args: dict, **kw) -> str:
+    """Materialize a previously-proposed profile, link it to the parent task.
+
+    Hard-fuses on ``profile_provisioning='off'`` so a hallucinating
+    worker LLM cannot create profiles even if it manages to reach this
+    handler. In ``manual`` mode requires that the dashboard has written
+    a ``profile.approved`` event for the target proposal — the team-
+    builder skill handles this by waiting for the approval event before
+    calling provision.
+
+    Calls ``hermes_cli.profiles.create_profile`` with ``clone_config=True``
+    so the new profile inherits config.yaml / SOUL.md / installed skills
+    from its base, then merges in any per-proposal skill / toolset
+    overrides, then records the entry on the parent task's
+    ``created_profiles`` JSON column.
+    """
+    proposal_event_id = args.get("proposal_event_id")
+    inline = args.get("inline") or {}
+
+    tid = _default_task_id(args.get("task_id"))
+    if not tid:
+        return tool_error("task_id is required (or set HERMES_KANBAN_TASK in the env)")
+
+    try:
+        kb, conn = _connect()
+    except Exception as e:
+        return tool_error(f"kanban_provision_profile: {e}")
+
+    try:
+        mode = kb.read_profile_provisioning_setting()
+        if mode == kb.PROVISIONING_OFF:
+            return tool_error(
+                "profile_provisioning is 'off'; refusing to provision. "
+                "An operator must enable manual or auto mode in the "
+                "kanban dashboard before profiles can be auto-created."
+            )
+
+        proposal_payload: dict
+        if proposal_event_id is not None:
+            row = conn.execute(
+                "SELECT payload, kind FROM task_events WHERE id = ? AND task_id = ?",
+                (int(proposal_event_id), tid),
+            ).fetchone()
+            if not row:
+                return tool_error(
+                    f"proposal_event_id {proposal_event_id} not found on task {tid}"
+                )
+            if row["kind"] != "profile.proposed":
+                return tool_error(
+                    f"event {proposal_event_id} is not a profile.proposed event"
+                )
+            try:
+                proposal_payload = json.loads(row["payload"]) if row["payload"] else {}
+            except Exception:
+                return tool_error("proposal payload is not valid JSON")
+            if not proposal_payload.get("ok", False):
+                conflicts = proposal_payload.get("conflicts") or []
+                return tool_error(
+                    f"proposal {proposal_event_id} has unresolved conflicts: {conflicts}"
+                )
+            # Manual mode requires an explicit approval event written by the
+            # dashboard (the human in the loop). Auto mode skips this check.
+            if mode == kb.PROVISIONING_MANUAL:
+                approval = conn.execute(
+                    "SELECT id FROM task_events WHERE task_id = ? "
+                    "AND kind = 'profile.approved' AND payload LIKE ? "
+                    "ORDER BY id DESC LIMIT 1",
+                    (tid, f'%"proposal_event_id": {int(proposal_event_id)}%'),
+                ).fetchone()
+                if not approval:
+                    return tool_error(
+                        "manual mode requires dashboard approval; the "
+                        "proposal has not been approved yet."
+                    )
+        else:
+            # No prior proposal — synthesize one from inline args. Useful
+            # for tests + auto mode where the propose/provision pair are
+            # called back-to-back. We still write the proposal event for
+            # observability before provisioning.
+            proposal_payload = {
+                "name": (inline.get("name") or "").strip(),
+                "role": (inline.get("role") or "").strip(),
+                "description": (inline.get("description") or "").strip(),
+                "base": (inline.get("base") or "").strip() or None,
+                "skills": inline.get("skills") or [],
+                "toolsets": inline.get("toolsets") or [],
+                "model": (inline.get("model") or "").strip() or None,
+            }
+            if not proposal_payload["name"]:
+                return tool_error("inline.name is required when no proposal_event_id")
+
+        from hermes_cli.profiles import (
+            normalize_profile_name, validate_profile_name,
+            profile_exists, create_profile,
+            seed_profile_skills,
+        )
+        canon = normalize_profile_name(proposal_payload["name"])
+        validate_profile_name(canon)
+        if profile_exists(canon):
+            return tool_error(
+                f"profile '{canon}' already exists; reuse instead of provisioning."
+            )
+
+        base = proposal_payload.get("base") or "default"
+        try:
+            profile_path = create_profile(
+                canon,
+                clone_from=base,
+                clone_config=True,
+            )
+        except FileExistsError:
+            return tool_error(f"profile '{canon}' already exists (race?)")
+        except (FileNotFoundError, ValueError) as e:
+            return tool_error(f"create_profile: {e}")
+
+        # Best-effort skill seed; failures here don't unwind the create
+        # because the profile directory is usable without it (skills can
+        # be installed later by the operator).
+        try:
+            seed_profile_skills(profile_path, quiet=True)
+        except Exception:
+            logger.exception("seed_profile_skills failed for %s", canon)
+
+        # Merge any per-proposal skill / toolset overrides into the new
+        # profile's config.yaml. Only writes when changes are needed so
+        # we don't reformat the inherited file unnecessarily.
+        _apply_proposal_overrides(profile_path, proposal_payload)
+
+        run_id = _worker_run_id(tid)
+        kb.record_created_profile(
+            conn, tid,
+            profile_name=canon,
+            role=proposal_payload.get("role"),
+            base=base,
+            run_id=run_id,
+        )
+        kb.append_event(
+            conn, tid, "profile.created",
+            {
+                "name": canon,
+                "role": proposal_payload.get("role"),
+                "base": base,
+                "profile_path": str(profile_path),
+                "proposal_event_id": (
+                    int(proposal_event_id) if proposal_event_id is not None else None
+                ),
+            },
+            run_id=run_id,
+        )
+        return _ok(
+            profile_name=canon,
+            profile_path=str(profile_path),
+            base=base,
+        )
+    except Exception as e:
+        logger.exception("kanban_provision_profile failed")
+        return tool_error(f"kanban_provision_profile: {e}")
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+def _apply_proposal_overrides(profile_path, proposal: dict) -> None:
+    """Merge proposal overrides (toolsets, model, role, description) into
+    the freshly-cloned profile's ``config.yaml``.
+
+    NOTE: ``skills`` from the proposal are NOT written to ``config.yaml`` —
+    Hermes does not have a profile-level "always load these skills" config
+    key. Preloaded skills are passed via the ``--skills`` CLI flag, which
+    in the kanban path comes from the ``tasks.skills`` JSON column
+    (see ``_default_spawn`` in ``hermes_cli/kanban_db.py``). When
+    creating child tasks for the new profile, the team-builder calls
+    ``kanban_create(skills=[...])`` to ship the per-task skill set.
+    The proposal's ``skills`` list is therefore advisory metadata —
+    surfaced via the proposal event payload — not a runtime config.
+
+    Conservative: only updates keys present in the proposal, and only
+    when their value differs from the cloned value.
+    """
+    cfg_path = profile_path / "config.yaml"
+    try:
+        import yaml
+        existing = {}
+        if cfg_path.exists():
+            with open(cfg_path, "r") as f:
+                existing = yaml.safe_load(f) or {}
+        changed = False
+        # Surface role + description on the profile so kanban_list_profiles
+        # can return them to future team-builder runs.
+        for key in ("role", "description"):
+            val = proposal.get(key)
+            if val and existing.get(key) != val:
+                existing[key] = val
+                changed = True
+        toolsets_override = proposal.get("toolsets") or []
+        if toolsets_override:
+            current_ts = existing.get("toolsets") or []
+            merged_ts = list(dict.fromkeys(list(current_ts) + list(toolsets_override)))
+            if merged_ts != current_ts:
+                existing["toolsets"] = merged_ts
+                changed = True
+        model = proposal.get("model")
+        if model and existing.get("model") != model:
+            existing["model"] = model
+            changed = True
+        if changed:
+            with open(cfg_path, "w") as f:
+                yaml.safe_dump(existing, f, sort_keys=False)
+    except Exception:
+        logger.exception("override merge failed for %s", profile_path)
+
+
+# ---------------------------------------------------------------------------
 # Schemas
 # ---------------------------------------------------------------------------
 
@@ -786,6 +1174,162 @@ KANBAN_LINK_SCHEMA = {
     },
 }
 
+KANBAN_LIST_PROFILES_SCHEMA = {
+    "name": "kanban_list_profiles",
+    "description": (
+        "Read the live profile roster — names, roles, descriptions, "
+        "loaded skills, toolsets, models, plus per-profile open / "
+        "running / done task counts. The team-builder skill calls "
+        "this BEFORE deciding whether to propose a new profile, so "
+        "the LLM can judge reuse vs. clone vs. create against the "
+        "actual inventory rather than guessing."
+    ),
+    "parameters": {"type": "object", "properties": {}, "required": []},
+}
+
+KANBAN_PROPOSE_PROFILE_SCHEMA = {
+    "name": "kanban_propose_profile",
+    "description": (
+        "Validate a candidate profile design (name, role, description, "
+        "base profile to clone from, skills, toolsets, model) and "
+        "record a structured ``profile.proposed`` event on the current "
+        "task. This does NOT create anything on disk; it just runs the "
+        "hard checks (name validity, alias collision, duplicate "
+        "profile) and persists the proposal so the dashboard can show "
+        "it for human approval (manual mode) or so a follow-up "
+        "``kanban_provision_profile`` call can materialize it (auto "
+        "mode). Returns ``{ok, proposal_event_id, conflicts, "
+        "requires_human_approval, mode}`` — when ``ok=false`` you must "
+        "fix conflicts or pick a different name before proposing again."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "task_id": {
+                "type": "string",
+                "description": _DESC_TASK_ID_DEFAULT,
+            },
+            "name": {
+                "type": "string",
+                "description": (
+                    "Lowercase profile identifier matching "
+                    "[a-z0-9][a-z0-9_-]{0,63}. Should describe the role "
+                    "(e.g. 'qa-engineer', 'frontend-dev') not the "
+                    "person. Avoid one-shot names like 'task-123-helper'."
+                ),
+            },
+            "role": {
+                "type": "string",
+                "description": (
+                    "Short role title (e.g. 'Backend engineer', "
+                    "'Translator'). Surfaced in dashboard lists and "
+                    "future ``kanban_list_profiles`` responses."
+                ),
+            },
+            "description": {
+                "type": "string",
+                "description": (
+                    "1-3 sentence description of the role's "
+                    "responsibilities. Used by future runs of the "
+                    "team-builder skill to judge whether this profile "
+                    "is the right reuse candidate."
+                ),
+            },
+            "base": {
+                "type": "string",
+                "description": (
+                    "Source profile to clone from (defaults to "
+                    "'default'). Use a more specialized base when one "
+                    "exists — e.g. clone from 'backend-dev' to inherit "
+                    "its toolsets when designing a 'backend-dev-react' "
+                    "specialization."
+                ),
+            },
+            "skills": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": (
+                    "Advisory skill list captured on the proposal "
+                    "payload. Hermes has no profile-level auto-load "
+                    "config; pass these names to ``kanban_create`` "
+                    "via its ``skills`` arg when fanning out child "
+                    "tasks for the new profile so the dispatcher "
+                    "loads them via ``--skills`` per spawn."
+                ),
+            },
+            "toolsets": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": (
+                    "Toolset names to enable on the new profile "
+                    "(additive over the base profile's toolsets)."
+                ),
+            },
+            "model": {
+                "type": "string",
+                "description": (
+                    "Model identifier override (e.g. "
+                    "'claude-sonnet-4-6'). Omit to inherit the base "
+                    "profile's model."
+                ),
+            },
+        },
+        "required": ["name", "role", "description"],
+    },
+}
+
+KANBAN_PROVISION_PROFILE_SCHEMA = {
+    "name": "kanban_provision_profile",
+    "description": (
+        "Materialize a previously-proposed profile (or an inline "
+        "design) on disk and link it to the current task's "
+        "``created_profiles`` audit trail. Hard-fuses on "
+        "``profile_provisioning='off'`` — refuses to run regardless "
+        "of arguments. In manual mode requires a corresponding "
+        "dashboard ``profile.approved`` event before it will create "
+        "the profile. In auto mode the team-builder skill calls this "
+        "right after a successful ``kanban_propose_profile`` to "
+        "complete the design-then-create cycle."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "task_id": {
+                "type": "string",
+                "description": _DESC_TASK_ID_DEFAULT,
+            },
+            "proposal_event_id": {
+                "type": "integer",
+                "description": (
+                    "ID of the prior ``profile.proposed`` event for "
+                    "this task. Required in manual mode (the dashboard "
+                    "approve flow keys off this id)."
+                ),
+            },
+            "inline": {
+                "type": "object",
+                "description": (
+                    "Inline proposal payload for cases where "
+                    "``kanban_propose_profile`` was not called first "
+                    "(auto-mode shortcut, tests). Fields mirror "
+                    "``kanban_propose_profile``: name (required), "
+                    "role, description, base, skills, toolsets, model."
+                ),
+                "properties": {
+                    "name": {"type": "string"},
+                    "role": {"type": "string"},
+                    "description": {"type": "string"},
+                    "base": {"type": "string"},
+                    "skills": {"type": "array", "items": {"type": "string"}},
+                    "toolsets": {"type": "array", "items": {"type": "string"}},
+                    "model": {"type": "string"},
+                },
+            },
+        },
+        "required": [],
+    },
+}
+
 
 # ---------------------------------------------------------------------------
 # Registration
@@ -852,4 +1396,31 @@ registry.register(
     handler=_handle_link,
     check_fn=_check_kanban_mode,
     emoji="🔗",
+)
+
+registry.register(
+    name="kanban_list_profiles",
+    toolset="kanban",
+    schema=KANBAN_LIST_PROFILES_SCHEMA,
+    handler=_handle_list_profiles,
+    check_fn=_check_kanban_mode,
+    emoji="👥",
+)
+
+registry.register(
+    name="kanban_propose_profile",
+    toolset="kanban",
+    schema=KANBAN_PROPOSE_PROFILE_SCHEMA,
+    handler=_handle_propose_profile,
+    check_fn=_check_kanban_mode,
+    emoji="📝",
+)
+
+registry.register(
+    name="kanban_provision_profile",
+    toolset="kanban",
+    schema=KANBAN_PROVISION_PROFILE_SCHEMA,
+    handler=_handle_provision_profile,
+    check_fn=_check_kanban_mode,
+    emoji="🆕",
 )

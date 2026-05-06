@@ -1484,3 +1484,210 @@ def test_board_exposes_diagnostics_list_and_summary(client):
     assert task_dict["warnings"] is not None
     assert task_dict["warnings"]["highest_severity"] == "error"
     assert task_dict["diagnostics"][0]["kind"] == "repeated_crashes"
+
+
+# ---------------------------------------------------------------------------
+# Auto-team profile provisioning endpoints
+# ---------------------------------------------------------------------------
+
+
+def test_get_settings_default_is_manual(client):
+    """Absent config key should yield 'manual' from a 'default' source."""
+    r = client.get("/api/plugins/kanban/settings/profile-provisioning")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["value"] == "manual"
+    assert body["source"] == "default"
+
+
+def test_patch_settings_to_off_persists(client, monkeypatch, tmp_path):
+    """Toggling to 'off' is non-transactional: just persists."""
+    cfg_path = tmp_path / ".hermes" / "config.yaml"
+    monkeypatch.setattr(
+        "hermes_cli.config.is_managed", lambda: False, raising=False,
+    )
+    r = client.patch(
+        "/api/plugins/kanban/settings/profile-provisioning",
+        json={"value": "off"},
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["value"] == "off"
+    assert body["source"] == "config"
+
+
+def test_patch_settings_to_auto_runs_bootstrap(client, monkeypatch, tmp_path):
+    """Toggling to 'auto' should install the skill (mocked) and create
+    the team-builder profile before persisting the setting."""
+    monkeypatch.setattr(
+        "hermes_cli.config.is_managed", lambda: False, raising=False,
+    )
+
+    install_calls = {"n": 0}
+
+    def fake_do_install(identifier, skip_confirm=False, invalidate_cache=False, **kw):
+        install_calls["n"] += 1
+        skill_dir = tmp_path / ".hermes" / "skills" / "kanban-team-builder"
+        skill_dir.mkdir(parents=True, exist_ok=True)
+        (skill_dir / "SKILL.md").write_text("---\nname: kanban-team-builder\n---\n")
+
+    monkeypatch.setattr(
+        "hermes_cli.skills_hub.do_install", fake_do_install, raising=False,
+    )
+
+    r = client.patch(
+        "/api/plugins/kanban/settings/profile-provisioning",
+        json={"value": "auto"},
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["value"] == "auto"
+    setup = body["provisioning_setup"]
+    assert setup["skill_installed_now"] is True
+    assert setup["profile_created_now"] is True
+    assert setup["team_builder_profile"] == "team-builder"
+    # team-builder profile dir exists. The skill is loaded via the
+    # dispatcher's --skills flag (injected into tasks.skills on
+    # assignee rewrite), not via a profile-level config field, so
+    # we don't write any always_load wiring inside config.yaml. The
+    # cloned config.yaml may not exist if the test's "default" home
+    # is empty (no source config to copy) — the profile dir on disk
+    # is the real precondition that lets the dispatcher target it.
+    profile_dir = tmp_path / ".hermes" / "profiles" / "team-builder"
+    assert profile_dir.is_dir()
+
+    # Idempotent: a second PATCH must not duplicate work.
+    r2 = client.patch(
+        "/api/plugins/kanban/settings/profile-provisioning",
+        json={"value": "auto"},
+    )
+    assert r2.status_code == 200
+    setup2 = r2.json()["provisioning_setup"]
+    assert setup2["skill_installed_now"] is False
+    assert setup2["profile_created_now"] is False
+    # do_install only called once (skill already on disk on second toggle).
+    assert install_calls["n"] == 1
+
+
+def test_patch_to_auto_aborts_on_install_failure(client, monkeypatch, tmp_path):
+    """If skill install fails, the setting must NOT be persisted and
+    no team-builder profile should be created."""
+    monkeypatch.setattr(
+        "hermes_cli.config.is_managed", lambda: False, raising=False,
+    )
+
+    def boom(*a, **kw):
+        raise RuntimeError("simulated install failure")
+
+    monkeypatch.setattr(
+        "hermes_cli.skills_hub.do_install", boom, raising=False,
+    )
+
+    r = client.patch(
+        "/api/plugins/kanban/settings/profile-provisioning",
+        json={"value": "auto"},
+    )
+    assert r.status_code == 409
+    # Setting did not flip — still default 'manual'.
+    r2 = client.get("/api/plugins/kanban/settings/profile-provisioning")
+    body = r2.json()
+    assert body["value"] == "manual"
+    assert body["source"] == "default"
+    # Profile not created.
+    assert not (tmp_path / ".hermes" / "profiles" / "team-builder").exists()
+
+
+def test_propose_then_approve_endpoint_creates_profile(
+    client, kanban_home, monkeypatch, tmp_path,
+):
+    """The dashboard approve endpoint should run create_profile + record
+    the profile on the parent task's created_profiles JSON."""
+    # Stub seed_profile_skills (which can hit network).
+    monkeypatch.setattr(
+        "hermes_cli.profiles.seed_profile_skills",
+        lambda *a, **k: None,
+        raising=False,
+    )
+    # Create a parent task with a proposal event by hand (simulating the
+    # kanban_propose_profile tool output).
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="root", assignee="root")
+        kb.append_event(conn, tid, "profile.proposed", {
+            "name": "qa-engineer",
+            "role": "QA Engineer",
+            "description": "Owns E2E tests.",
+            "base": "default",
+            "skills": [],
+            "toolsets": [],
+            "model": None,
+            "conflicts": [],
+            "ok": True,
+        })
+        ev = conn.execute(
+            "SELECT id FROM task_events WHERE kind = 'profile.proposed' "
+            "ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+        proposal_event_id = int(ev["id"])
+    finally:
+        conn.close()
+
+    r = client.post(
+        f"/api/plugins/kanban/profiles/proposals/{proposal_event_id}/approve",
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["ok"] is True
+    assert body["profile_name"] == "qa-engineer"
+    profile_dir = tmp_path / ".hermes" / "profiles" / "qa-engineer"
+    assert profile_dir.is_dir()
+    # Parent task's created_profiles records the new entry.
+    conn = kb.connect()
+    try:
+        row = conn.execute(
+            "SELECT created_profiles FROM tasks WHERE id = ?", (tid,),
+        ).fetchone()
+        import json as _json
+        entries = _json.loads(row["created_profiles"])
+        assert any(e["name"] == "qa-engineer" for e in entries)
+    finally:
+        conn.close()
+
+
+def test_reject_endpoint_writes_event_and_comment(client, kanban_home):
+    """Rejecting a proposal should emit profile.rejected and add a comment."""
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="root", assignee="root")
+        kb.append_event(conn, tid, "profile.proposed", {
+            "name": "rejected-role",
+            "role": "Bad Idea",
+            "description": "x",
+            "ok": True,
+        })
+        ev = conn.execute(
+            "SELECT id FROM task_events ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+        proposal_event_id = int(ev["id"])
+    finally:
+        conn.close()
+    r = client.post(
+        f"/api/plugins/kanban/profiles/proposals/{proposal_event_id}/reject",
+        json={"reason": "duplicate of qa-engineer"},
+    )
+    assert r.status_code == 200
+    conn = kb.connect()
+    try:
+        kinds = [
+            r["kind"] for r in conn.execute(
+                "SELECT kind FROM task_events WHERE task_id = ?", (tid,),
+            )
+        ]
+        assert "profile.rejected" in kinds
+        comment_count = conn.execute(
+            "SELECT COUNT(*) AS n FROM task_comments WHERE task_id = ?",
+            (tid,),
+        ).fetchone()["n"]
+        assert comment_count == 1
+    finally:
+        conn.close()

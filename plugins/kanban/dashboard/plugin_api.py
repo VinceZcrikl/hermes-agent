@@ -1450,6 +1450,492 @@ def switch_board(slug: str):
 
 
 # ---------------------------------------------------------------------------
+# Auto-team profile provisioning — read endpoints
+# ---------------------------------------------------------------------------
+#
+# These endpoints surface the kanban-team-builder feature in the dashboard:
+#   GET  /profiles                        — full roster + per-profile counts
+#   GET  /profiles/proposals              — pending / approved / rejected
+#   POST /profiles/proposals/{id}/approve — materialize via kanban_provision
+#   POST /profiles/proposals/{id}/reject  — record rejection + comment
+#   GET  /settings/profile-provisioning   — read switch (off / manual / auto)
+#   PATCH /settings/profile-provisioning  — toggle, transactional on `auto`
+#
+# Mode semantics live in hermes_cli.kanban_db:
+#   off    — strict legacy: dispatcher silently skips unspawnable assignees.
+#   manual — dispatcher emits profile.required events; humans approve here.
+#   auto   — dispatcher rewrites assignees to `team-builder`; LLM provisions.
+# Default is `manual` when the key is absent.
+
+
+def _proposal_state(conn: sqlite3.Connection, proposal_event_id: int) -> str:
+    """Resolve a proposal's current state by following any approval/rejection
+    event pointing back at it. Returns one of pending / approved / rejected /
+    provisioned (the latter when ``profile.created`` references the proposal).
+    """
+    needle = f'"proposal_event_id": {int(proposal_event_id)}'
+    row = conn.execute(
+        "SELECT kind FROM task_events "
+        "WHERE kind IN ('profile.approved','profile.rejected','profile.created') "
+        "  AND payload LIKE ? "
+        "ORDER BY id DESC LIMIT 1",
+        (f"%{needle}%",),
+    ).fetchone()
+    if not row:
+        return "pending"
+    if row["kind"] == "profile.created":
+        return "provisioned"
+    if row["kind"] == "profile.approved":
+        return "approved"
+    return "rejected"
+
+
+@router.get("/profiles")
+def list_profiles_endpoint(board: Optional[str] = Query(None)):
+    """Roster of installed profiles + per-profile open / running / done counts.
+
+    Distinct from ``/assignees`` (which returns names + counts only): this
+    surfaces the role / description / loaded skills / toolsets / model so
+    the dashboard's auto-team panel can show meaningful per-profile cards
+    without a second round-trip for each profile.
+    """
+    try:
+        from hermes_cli.profiles import list_profiles
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"profiles unavailable: {exc}")
+    board = _resolve_board(board)
+    conn = _conn(board=board)
+    try:
+        counts: dict[str, dict[str, int]] = {}
+        cur = conn.execute(
+            "SELECT assignee, status, COUNT(*) AS n "
+            "FROM tasks WHERE assignee IS NOT NULL "
+            "GROUP BY assignee, status"
+        )
+        for row in cur:
+            bucket = counts.setdefault(
+                row["assignee"], {"open": 0, "running": 0, "done": 0},
+            )
+            st = row["status"]
+            if st == "running":
+                bucket["running"] += int(row["n"])
+            elif st in ("done", "archived"):
+                bucket["done"] += int(row["n"])
+            else:
+                bucket["open"] += int(row["n"])
+    finally:
+        conn.close()
+
+    out = []
+    for p in list_profiles():
+        cfg_path = p.path / "config.yaml"
+        cfg: dict = {}
+        if cfg_path.exists():
+            try:
+                import yaml
+                with open(cfg_path, "r") as f:
+                    cfg = yaml.safe_load(f) or {}
+            except Exception:
+                cfg = {}
+        out.append({
+            "name": p.name,
+            "is_default": p.is_default,
+            "model": p.model,
+            "provider": p.provider,
+            "skill_count": p.skill_count,
+            "role": cfg.get("role"),
+            "description": cfg.get("description") or cfg.get("about"),
+            "toolsets": cfg.get("toolsets") or [],
+            "task_counts": counts.get(p.name, {"open": 0, "running": 0, "done": 0}),
+        })
+    return {"profiles": out}
+
+
+@router.get("/profiles/proposals")
+def list_proposals(
+    status: str = Query("pending"),
+    board: Optional[str] = Query(None),
+):
+    """List ``profile.proposed`` events, filtered by current state.
+
+    ``status`` is one of pending / approved / rejected / provisioned / all.
+    The state is recomputed per proposal by walking subsequent
+    ``profile.approved`` / ``profile.rejected`` / ``profile.created``
+    events that reference its id.
+    """
+    valid = {"pending", "approved", "rejected", "provisioned", "all"}
+    if status not in valid:
+        raise HTTPException(status_code=400, detail=f"status must be one of {sorted(valid)}")
+    board = _resolve_board(board)
+    conn = _conn(board=board)
+    try:
+        rows = conn.execute(
+            "SELECT id, task_id, payload, created_at FROM task_events "
+            "WHERE kind = 'profile.proposed' ORDER BY id DESC"
+        ).fetchall()
+        out = []
+        for r in rows:
+            try:
+                payload = json.loads(r["payload"]) if r["payload"] else {}
+            except Exception:
+                payload = {}
+            state = _proposal_state(conn, r["id"])
+            if status != "all" and state != status:
+                continue
+            out.append({
+                "proposal_event_id": int(r["id"]),
+                "task_id": r["task_id"],
+                "created_at": int(r["created_at"]),
+                "state": state,
+                "payload": payload,
+            })
+        return {"proposals": out}
+    finally:
+        conn.close()
+
+
+@router.post("/profiles/proposals/{proposal_event_id}/approve")
+def approve_proposal(
+    proposal_event_id: int,
+    board: Optional[str] = Query(None),
+):
+    """Approve a pending proposal and materialize the profile on disk.
+
+    Two-step in the DB: writes a ``profile.approved`` audit event first,
+    then calls into the same code path the agent uses
+    (``hermes_cli.profiles.create_profile``). Repeated calls are idempotent
+    — a second approve on a ``provisioned`` proposal is a no-op rather
+    than an error.
+    """
+    board = _resolve_board(board)
+    conn = _conn(board=board)
+    try:
+        row = conn.execute(
+            "SELECT task_id, payload FROM task_events "
+            "WHERE id = ? AND kind = 'profile.proposed'",
+            (int(proposal_event_id),),
+        ).fetchone()
+        if not row:
+            raise HTTPException(
+                status_code=404,
+                detail=f"proposal {proposal_event_id} not found",
+            )
+        try:
+            payload = json.loads(row["payload"]) if row["payload"] else {}
+        except Exception:
+            raise HTTPException(status_code=400, detail="proposal payload corrupt")
+        if not payload.get("ok", False):
+            raise HTTPException(
+                status_code=409,
+                detail=f"proposal has unresolved conflicts: {payload.get('conflicts') or []}",
+            )
+        existing_state = _proposal_state(conn, proposal_event_id)
+        if existing_state == "provisioned":
+            return {"ok": True, "state": "provisioned", "idempotent": True}
+        if existing_state == "rejected":
+            raise HTTPException(
+                status_code=409,
+                detail="proposal was previously rejected; create a new proposal",
+            )
+
+        # Audit event first so the agent-side provision tool can find it.
+        kanban_db.append_event(
+            conn, row["task_id"], "profile.approved",
+            {
+                "proposal_event_id": int(proposal_event_id),
+                "approved_by": "dashboard",
+            },
+        )
+
+        from hermes_cli.profiles import (
+            normalize_profile_name, validate_profile_name, profile_exists,
+            create_profile, seed_profile_skills,
+        )
+        try:
+            canon = normalize_profile_name(payload.get("name") or "")
+            validate_profile_name(canon)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=f"invalid name: {exc}")
+        if profile_exists(canon):
+            # Treat as "already done": link the existing profile to the
+            # task without re-cloning. The agent flow does the same.
+            kanban_db.record_created_profile(
+                conn, row["task_id"],
+                profile_name=canon,
+                role=payload.get("role"),
+                base=payload.get("base") or "default",
+            )
+            kanban_db.append_event(
+                conn, row["task_id"], "profile.created",
+                {
+                    "name": canon,
+                    "role": payload.get("role"),
+                    "base": payload.get("base") or "default",
+                    "profile_path": None,
+                    "proposal_event_id": int(proposal_event_id),
+                    "linked_existing": True,
+                },
+            )
+            return {"ok": True, "profile_name": canon, "state": "provisioned",
+                    "linked_existing": True}
+
+        base = payload.get("base") or "default"
+        try:
+            profile_path = create_profile(
+                canon, clone_from=base, clone_config=True,
+            )
+        except (FileNotFoundError, ValueError, FileExistsError) as exc:
+            raise HTTPException(status_code=400, detail=f"create_profile: {exc}")
+        try:
+            seed_profile_skills(profile_path, quiet=True)
+        except Exception:
+            log.exception("seed_profile_skills failed")
+
+        # Apply skill / toolset / model overrides from the proposal so the
+        # dashboard-approved path matches the agent's auto-mode path.
+        try:
+            from tools.kanban_tools import _apply_proposal_overrides
+            _apply_proposal_overrides(profile_path, payload)
+        except Exception:
+            log.exception("apply overrides failed")
+
+        kanban_db.record_created_profile(
+            conn, row["task_id"],
+            profile_name=canon,
+            role=payload.get("role"),
+            base=base,
+        )
+        kanban_db.append_event(
+            conn, row["task_id"], "profile.created",
+            {
+                "name": canon,
+                "role": payload.get("role"),
+                "base": base,
+                "profile_path": str(profile_path),
+                "proposal_event_id": int(proposal_event_id),
+            },
+        )
+        return {
+            "ok": True,
+            "profile_name": canon,
+            "profile_path": str(profile_path),
+            "state": "provisioned",
+        }
+    finally:
+        conn.close()
+
+
+class RejectProposalBody(BaseModel):
+    reason: str
+
+
+@router.post("/profiles/proposals/{proposal_event_id}/reject")
+def reject_proposal(
+    proposal_event_id: int,
+    payload: RejectProposalBody,
+    board: Optional[str] = Query(None),
+):
+    """Reject a pending proposal and post a comment with the reason.
+
+    The orchestrator that emitted the proposal can monitor for the
+    rejection event and re-design without retrying the same name.
+    """
+    if not (payload.reason or "").strip():
+        raise HTTPException(status_code=400, detail="reason is required")
+    board = _resolve_board(board)
+    conn = _conn(board=board)
+    try:
+        row = conn.execute(
+            "SELECT task_id, payload FROM task_events "
+            "WHERE id = ? AND kind = 'profile.proposed'",
+            (int(proposal_event_id),),
+        ).fetchone()
+        if not row:
+            raise HTTPException(
+                status_code=404,
+                detail=f"proposal {proposal_event_id} not found",
+            )
+        existing_state = _proposal_state(conn, proposal_event_id)
+        if existing_state in ("provisioned", "approved"):
+            raise HTTPException(
+                status_code=409,
+                detail=f"proposal is already {existing_state}; cannot reject",
+            )
+        try:
+            proposal_payload = json.loads(row["payload"]) if row["payload"] else {}
+        except Exception:
+            proposal_payload = {}
+        kanban_db.append_event(
+            conn, row["task_id"], "profile.rejected",
+            {
+                "proposal_event_id": int(proposal_event_id),
+                "reason": payload.reason,
+                "rejected_by": "dashboard",
+            },
+        )
+        # Mirror the rejection into the comment thread so it shows up in
+        # the task drawer alongside other human notes.
+        try:
+            kanban_db.add_comment(
+                conn, row["task_id"],
+                author="dashboard",
+                body=(
+                    f"Profile proposal rejected: "
+                    f"`{proposal_payload.get('name', '?')}` "
+                    f"({proposal_payload.get('role', '?')}). "
+                    f"Reason: {payload.reason}"
+                ),
+            )
+        except Exception:
+            log.exception("comment for rejection failed")
+        return {"ok": True, "state": "rejected"}
+    finally:
+        conn.close()
+
+
+@router.get("/settings/profile-provisioning")
+def get_profile_provisioning_setting():
+    """Read the active provisioning mode (off / manual / auto).
+
+    Falls back to ``manual`` (the new default) when the key is absent
+    from ``~/.hermes/config.yaml``. ``source`` tells the UI whether the
+    value comes from explicit config or the default.
+    """
+    try:
+        from hermes_cli.config import load_config
+        cfg = load_config() or {}
+    except Exception:
+        cfg = {}
+    dash = (cfg.get("dashboard") or {})
+    k = dash.get("kanban") or {}
+    raw = k.get("profile_provisioning")
+    if isinstance(raw, str) and raw.strip().lower() in kanban_db.PROVISIONING_VALUES:
+        return {"value": raw.strip().lower(), "source": "config"}
+    return {"value": kanban_db.PROVISIONING_DEFAULT, "source": "default"}
+
+
+class UpdateProfileProvisioningBody(BaseModel):
+    value: str
+    scope: str = "global"  # reserved; per-board scope is a future extension
+
+
+@router.patch("/settings/profile-provisioning")
+def patch_profile_provisioning_setting(payload: UpdateProfileProvisioningBody):
+    """Change the provisioning mode. ``auto`` runs a transactional bootstrap
+    (install kanban-team-builder skill, create team-builder profile) before
+    persisting the value. Failure aborts the toggle so we never leave the
+    setting at ``auto`` without the supporting plumbing in place.
+    """
+    val = (payload.value or "").strip().lower()
+    if val not in kanban_db.PROVISIONING_VALUES:
+        raise HTTPException(
+            status_code=400,
+            detail=f"value must be one of {list(kanban_db.PROVISIONING_VALUES)}",
+        )
+
+    setup_report = {
+        "skill_installed_now": False,
+        "profile_created_now": False,
+        "team_builder_profile": None,
+    }
+
+    if val == kanban_db.PROVISIONING_AUTO:
+        # Transactional bootstrap. Each step is idempotent — repeated
+        # PATCH calls converge to the same state without duplicate work.
+        try:
+            from hermes_constants import get_hermes_home
+            home = get_hermes_home()
+            skill_dir = home / "skills" / "kanban-team-builder"
+            if not (skill_dir / "SKILL.md").exists():
+                try:
+                    from hermes_cli.skills_hub import do_install
+                except Exception as exc:
+                    raise HTTPException(
+                        status_code=500,
+                        detail=f"skills hub unavailable: {exc}",
+                    )
+                try:
+                    do_install(
+                        "official/devops/kanban-team-builder",
+                        skip_confirm=True,
+                        invalidate_cache=True,
+                    )
+                except Exception as exc:
+                    raise HTTPException(
+                        status_code=409,
+                        detail=(
+                            "auto mode requires kanban-team-builder skill "
+                            f"but install failed: {exc}. Setting not changed."
+                        ),
+                    )
+                setup_report["skill_installed_now"] = True
+
+            from hermes_cli.profiles import (
+                profile_exists, create_profile,
+            )
+            if not profile_exists(kanban_db.TEAM_BUILDER_PROFILE):
+                try:
+                    profile_path = create_profile(
+                        kanban_db.TEAM_BUILDER_PROFILE,
+                        clone_from="default",
+                        clone_config=True,
+                    )
+                except Exception as exc:
+                    raise HTTPException(
+                        status_code=409,
+                        detail=(
+                            f"failed to create '{kanban_db.TEAM_BUILDER_PROFILE}' "
+                            f"profile: {exc}. Setting not changed."
+                        ),
+                    )
+                # No profile-level "always_load" field exists in Hermes —
+                # preloaded skills are passed via ``--skills`` per CLI
+                # invocation. The kanban dispatcher injects
+                # ``kanban-team-builder`` into ``tasks.skills`` whenever it
+                # routes a task to the team-builder profile (see
+                # ``rewrite_assignee_for_team_builder``), so the spawned
+                # worker gets the skill via the existing per-task
+                # mechanism — no profile config wiring needed here.
+                setup_report["profile_created_now"] = True
+            setup_report["team_builder_profile"] = kanban_db.TEAM_BUILDER_PROFILE
+        except HTTPException:
+            raise
+        except Exception as exc:
+            log.exception("auto-mode bootstrap failed")
+            raise HTTPException(
+                status_code=500,
+                detail=f"auto-mode bootstrap failed: {exc}",
+            )
+
+    # Persist the setting last so any failure above leaves the previous
+    # value intact (transactional toggle).
+    try:
+        from hermes_cli.config import load_config, save_config
+        cfg = load_config() or {}
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"config read failed: {exc}")
+    dash = cfg.setdefault("dashboard", {}) if isinstance(cfg.get("dashboard"), dict) or "dashboard" not in cfg else cfg["dashboard"]
+    if not isinstance(dash, dict):
+        dash = {}
+        cfg["dashboard"] = dash
+    k = dash.setdefault("kanban", {}) if isinstance(dash.get("kanban"), dict) or "kanban" not in dash else dash["kanban"]
+    if not isinstance(k, dict):
+        k = {}
+        dash["kanban"] = k
+    k["profile_provisioning"] = val
+    try:
+        save_config(cfg)
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"config save failed: {exc}")
+
+    return {
+        "value": val,
+        "source": "config",
+        "provisioning_setup": setup_report,
+    }
+
+
+# ---------------------------------------------------------------------------
 # WebSocket: /events?since=<event_id>
 # ---------------------------------------------------------------------------
 
