@@ -1,9 +1,10 @@
 import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
-import { ChevronDown, Pencil, Plus, Terminal, Trash2, Users, X } from "lucide-react";
+import { ChevronDown, Cpu, Pencil, Plus, Terminal, Trash2, Users, X } from "lucide-react";
 import { H2 } from "@/components/NouiTypography";
 import { api } from "@/lib/api";
 import type { ProfileInfo } from "@/lib/api";
 import { DeleteConfirmDialog } from "@/components/DeleteConfirmDialog";
+import { ProfileModelDialog } from "@/components/ProfileModelDialog";
 import { useToast } from "@/hooks/useToast";
 import { useConfirmDelete } from "@/hooks/useConfirmDelete";
 import { useModalBehavior } from "@/hooks/useModalBehavior";
@@ -50,6 +51,9 @@ export default function ProfilesPage() {
   // Tracks the latest SOUL request so out-of-order responses don't overwrite
   // newer state when the user switches profiles or closes the editor.
   const activeSoulRequest = useRef<string | null>(null);
+
+  // Per-profile model configuration popup
+  const [modelDialogFor, setModelDialogFor] = useState<string | null>(null);
 
   const load = useCallback(() => {
     api
@@ -224,6 +228,17 @@ export default function ProfilesPage() {
         }
         loading={profileDelete.isDeleting}
       />
+
+      {modelDialogFor && (
+        <ProfileModelDialog
+          profileName={modelDialogFor}
+          onError={(msg) => showToast(`${t.status.error}: ${msg}`, "error")}
+          onClose={() => {
+            setModelDialogFor(null);
+            load();
+          }}
+        />
+      )}
 
       {/* Create profile modal */}
       {createModalOpen && (
@@ -420,6 +435,15 @@ export default function ProfilesPage() {
                             S
                           </span>
                         )}
+                      </Button>
+                      <Button
+                        ghost
+                        size="icon"
+                        title={t.profiles.configureModel}
+                        aria-label={t.profiles.configureModel}
+                        onClick={() => setModelDialogFor(p.name)}
+                      >
+                        <Cpu className="h-4 w-4" />
                       </Button>
                       <Button
                         ghost

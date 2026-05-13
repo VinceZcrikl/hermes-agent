@@ -315,6 +315,13 @@ export interface Translations {
     created: string;
     deleted: string;
     renamed: string;
+    configureModel: string;
+    configureModelTitle: string;
+    configureModelSubtitle: string;
+    profileModel: string;
+    setProfileModelTitle: string;
+    modelUnset: string;
+    change: string;
   };
 
   // ── Skills page ──

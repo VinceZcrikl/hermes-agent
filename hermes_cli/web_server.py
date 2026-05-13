@@ -2650,6 +2650,12 @@ class ProfileSoulUpdate(BaseModel):
     content: str
 
 
+class ProfileModelUpdate(BaseModel):
+    """Payload for PUT /api/profiles/{name}/model — set the profile's main model."""
+    provider: str
+    model: str
+
+
 def _profile_attr(info, name: str, default: Any = None) -> Any:
     try:
         return getattr(info, name)
@@ -2880,6 +2886,143 @@ async def update_profile_soul(name: str, body: ProfileSoulUpdate):
         _log.exception("PUT /api/profiles/%s/soul failed", name)
         raise HTTPException(status_code=500, detail=f"Could not write SOUL.md: {e}")
     return {"ok": True}
+
+
+def _read_profile_config_yaml(profile_dir: Path) -> Dict[str, Any]:
+    """Read a profile's config.yaml directly, bypassing the HERMES_HOME-scoped cache.
+
+    Returns ``{}`` when the file is absent or unparseable.  We avoid
+    ``load_config()`` here because it always resolves through
+    ``get_config_path()`` (i.e. the active profile) and caches the result.
+    """
+    config_path = profile_dir / "config.yaml"
+    if not config_path.is_file():
+        return {}
+    try:
+        with open(config_path, "r", encoding="utf-8") as f:
+            data = yaml.safe_load(f) or {}
+    except Exception:
+        _log.exception("Failed to read %s", config_path)
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _write_profile_config_yaml(profile_dir: Path, cfg: Dict[str, Any]) -> None:
+    """Atomically write a profile's config.yaml.  Respects ``is_managed``."""
+    from hermes_cli.config import is_managed, managed_error
+    from utils import atomic_yaml_write
+
+    if is_managed():
+        managed_error("save configuration")
+        raise HTTPException(
+            status_code=403,
+            detail="Hermes is running in managed mode — config.yaml is read-only.",
+        )
+    atomic_yaml_write(profile_dir / "config.yaml", cfg)
+
+
+@app.get("/api/profiles/{name}/model")
+async def get_profile_model(name: str):
+    """Return the profile's currently configured main model + provider."""
+    profile_dir = _resolve_profile_dir(name)
+    cfg = _read_profile_config_yaml(profile_dir)
+    model_cfg = cfg.get("model", {})
+    if isinstance(model_cfg, dict):
+        provider = str(model_cfg.get("provider", "") or "")
+        model = str(
+            model_cfg.get("default", model_cfg.get("name", "")) or ""
+        )
+    else:
+        provider = ""
+        model = str(model_cfg) if model_cfg else ""
+    return {"provider": provider, "model": model}
+
+
+@app.put("/api/profiles/{name}/model")
+async def set_profile_model(name: str, body: ProfileModelUpdate):
+    """Set the profile's main model + provider in its own config.yaml.
+
+    Mirrors the hygiene applied by POST /api/model/set for the global slot:
+    clears stale ``base_url`` and ``context_length`` so the new model gets
+    the provider's own resolution.
+    """
+    provider = (body.provider or "").strip()
+    model = (body.model or "").strip()
+    if not provider or not model:
+        raise HTTPException(status_code=400, detail="provider and model required")
+
+    profile_dir = _resolve_profile_dir(name)
+    cfg = _read_profile_config_yaml(profile_dir)
+    model_cfg = cfg.get("model", {})
+    if not isinstance(model_cfg, dict):
+        model_cfg = {}
+    model_cfg["provider"] = provider
+    model_cfg["default"] = model
+    if model_cfg.get("base_url"):
+        model_cfg["base_url"] = ""
+    model_cfg.pop("context_length", None)
+    cfg["model"] = model_cfg
+
+    try:
+        _write_profile_config_yaml(profile_dir, cfg)
+    except HTTPException:
+        raise
+    except Exception:
+        _log.exception("PUT /api/profiles/%s/model failed", name)
+        raise HTTPException(status_code=500, detail="Failed to save profile model")
+    return {"ok": True, "provider": provider, "model": model}
+
+
+@app.get("/api/profiles/{name}/model/options")
+async def get_profile_model_options(name: str):
+    """Profile-scoped variant of /api/model/options.
+
+    Resolves provider/model availability against the *target* profile's
+    config.yaml + ``.env`` + auth-profiles, not the dashboard's active
+    profile.  This is what the per-profile model picker on the Profiles
+    page consumes.
+    """
+    try:
+        from hermes_cli.model_switch import list_authenticated_providers
+
+        profile_dir = _resolve_profile_dir(name)
+        cfg = _read_profile_config_yaml(profile_dir)
+        model_cfg = cfg.get("model", {})
+        if isinstance(model_cfg, dict):
+            current_model = model_cfg.get("default", model_cfg.get("name", "")) or ""
+            current_provider = model_cfg.get("provider", "") or ""
+            current_base_url = model_cfg.get("base_url", "") or ""
+        else:
+            current_model = str(model_cfg) if model_cfg else ""
+            current_provider = ""
+            current_base_url = ""
+
+        user_providers = cfg.get("providers") if isinstance(cfg.get("providers"), dict) else {}
+        custom_providers = (
+            cfg.get("custom_providers")
+            if isinstance(cfg.get("custom_providers"), list)
+            else []
+        )
+
+        providers = list_authenticated_providers(
+            current_provider=current_provider,
+            current_base_url=current_base_url,
+            current_model=current_model,
+            user_providers=user_providers,
+            custom_providers=custom_providers,
+            max_models=50,
+            profile_dir=profile_dir,
+        )
+        return {
+            "providers": providers,
+            "model": current_model,
+            "provider": current_provider,
+        }
+    except HTTPException:
+        raise
+    except Exception:
+        _log.exception("GET /api/profiles/%s/model/options failed", name)
+        raise HTTPException(status_code=500, detail="Failed to list model options")
 
 
 # ---------------------------------------------------------------------------

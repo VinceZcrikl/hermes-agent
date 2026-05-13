@@ -194,6 +194,26 @@ export const api = {
         body: JSON.stringify({ content }),
       },
     ),
+  getProfileModel: (name: string) =>
+    fetchJSON<{ provider: string; model: string }>(
+      `/api/profiles/${encodeURIComponent(name)}/model`,
+    ),
+  setProfileModel: (
+    name: string,
+    body: { provider: string; model: string },
+  ) =>
+    fetchJSON<{ ok: boolean; provider: string; model: string }>(
+      `/api/profiles/${encodeURIComponent(name)}/model`,
+      {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+      },
+    ),
+  getProfileModelOptions: (name: string) =>
+    fetchJSON<ModelOptionsResponse>(
+      `/api/profiles/${encodeURIComponent(name)}/model/options`,
+    ),
 
   // Skills & Toolsets
   getSkills: () => fetchJSON<SkillInfo[]>("/api/skills"),

@@ -256,6 +256,13 @@ export const en: Translations = {
     created: "Created",
     deleted: "Deleted",
     renamed: "Renamed",
+    configureModel: "Configure model",
+    configureModelTitle: "Configure model for {name}",
+    configureModelSubtitle: "Saves to this profile's config.yaml — applies to new sessions.",
+    profileModel: "Profile model",
+    setProfileModelTitle: "Set model for {name}",
+    modelUnset: "(unset)",
+    change: "Change",
   },
 
   pluginsPage: {
