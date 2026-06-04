@@ -1364,6 +1364,30 @@ class SessionDB:
             row = cursor.fetchone()
         return dict(row) if row else None
 
+    def list_root_sessions_by_id_prefix(
+        self, prefix: str, source: Optional[str] = None
+    ) -> List[Dict[str, Any]]:
+        """List root sessions whose IDs begin with a literal prefix."""
+        escaped = (
+            prefix
+            .replace("\\", "\\\\")
+            .replace("%", "\\%")
+            .replace("_", "\\_")
+        )
+        where = ["id LIKE ? ESCAPE '\\'", "parent_session_id IS NULL"]
+        params: List[Any] = [f"{escaped}%"]
+        if source:
+            where.append("source = ?")
+            params.append(source)
+
+        with self._lock:
+            cursor = self._conn.execute(
+                f"SELECT * FROM sessions WHERE {' AND '.join(where)} "
+                "ORDER BY started_at DESC, id DESC",
+                params,
+            )
+            return [dict(row) for row in cursor.fetchall()]
+
     def resolve_session_id(self, session_id_or_prefix: str) -> Optional[str]:
         """Resolve an exact or uniquely prefixed session ID to the full ID.
 
@@ -2143,6 +2167,28 @@ class SessionDB:
                     msg["tool_calls"] = []
             result.append(msg)
         return result
+
+    def get_messages_in_lineage(
+        self, session_id: str, include_inactive: bool = False
+    ) -> List[Dict[str, Any]]:
+        """Load a full compression lineage while preserving message metadata.
+
+        Unlike :meth:`get_messages_as_conversation`, this returns the raw
+        stored-message shape, including timestamps and tool metadata needed by
+        read-only transcript UIs.
+        """
+        tip_id = self.get_compression_tip(session_id) or session_id
+        messages: List[Dict[str, Any]] = []
+
+        for lineage_id in self._session_lineage_root_to_tip(tip_id):
+            for msg in self.get_messages(
+                lineage_id, include_inactive=include_inactive
+            ):
+                if self._is_duplicate_replayed_user_message(messages, msg):
+                    continue
+                messages.append(msg)
+
+        return messages
 
     def get_messages_around(
         self,

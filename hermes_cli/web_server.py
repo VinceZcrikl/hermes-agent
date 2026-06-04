@@ -5509,6 +5509,41 @@ def _find_cron_job_profile(job_id: str) -> Optional[str]:
     return None
 
 
+def _is_cron_run_session_id(session_id: str, prefix: str) -> bool:
+    suffix = session_id[len(prefix):]
+    return (
+        session_id.startswith(prefix)
+        and len(suffix) == 15
+        and suffix[8] == "_"
+        and suffix[:8].isdigit()
+        and suffix[9:].isdigit()
+    )
+
+
+def _unavailable_cron_media(messages: List[Dict[str, Any]]) -> List[str]:
+    """Return MEDIA paths that cannot be safely read from local storage."""
+    from gateway.platforms.base import BasePlatformAdapter
+
+    unavailable = set()
+    for message in messages:
+        content = message.get("content")
+        if not isinstance(content, str):
+            continue
+
+        media_files, _ = BasePlatformAdapter.extract_media(content)
+        for media_path, _is_voice in media_files:
+            try:
+                path = Path(media_path).expanduser()
+                available = path.is_file() and os.access(path, os.R_OK)
+            except (OSError, RuntimeError, ValueError):
+                available = False
+
+            if not available:
+                unavailable.add(media_path)
+
+    return sorted(unavailable)
+
+
 @app.get("/api/cron/jobs")
 async def list_cron_jobs(profile: str = "all"):
     requested = (profile or "all").strip()
@@ -5525,6 +5560,55 @@ async def list_cron_jobs(profile: str = "all"):
         except Exception:
             _log.exception("Failed to list cron jobs for profile %s", name)
     return jobs
+
+
+@app.get("/api/cron/jobs/{job_id}/runs")
+async def get_cron_job_runs(job_id: str, profile: Optional[str] = None):
+    selected = profile or _find_cron_job_profile(job_id)
+    if not selected:
+        raise HTTPException(status_code=404, detail="Job not found")
+
+    job = _call_cron_for_profile(selected, "get_job", job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+
+    profile_name, home = _cron_profile_home(selected)
+    canonical_job_id = str(job.get("id") or job_id)
+    db_path = home / "state.db"
+    if not db_path.exists():
+        return {"job_id": canonical_job_id, "profile": profile_name, "runs": []}
+
+    from hermes_state import SessionDB
+
+    db = SessionDB(db_path)
+    try:
+        prefix = f"cron_{canonical_job_id}_"
+        sessions = db.list_root_sessions_by_id_prefix(prefix, source="cron")
+        runs = []
+
+        for session in sessions:
+            session_id = str(session.get("id") or "")
+            if not _is_cron_run_session_id(session_id, prefix):
+                continue
+
+            tip_id = db.get_compression_tip(session_id) or session_id
+            tip = db.get_session(tip_id) or session
+            messages = db.get_messages_in_lineage(session_id)
+            runs.append(
+                {
+                    "session_id": session_id,
+                    "started_at": session.get("started_at") or 0,
+                    "ended_at": tip.get("ended_at"),
+                    "end_reason": tip.get("end_reason"),
+                    "message_count": len(messages),
+                    "messages": messages,
+                    "unavailable_media": _unavailable_cron_media(messages),
+                }
+            )
+
+        return {"job_id": canonical_job_id, "profile": profile_name, "runs": runs}
+    finally:
+        db.close()
 
 
 @app.get("/api/cron/jobs/{job_id}")

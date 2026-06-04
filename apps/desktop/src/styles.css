@@ -840,6 +840,16 @@ canvas {
   mask-image: none;
 }
 
+.cron-history-transcript .sticky-human-clamp,
+.cron-history-transcript .sticky-human-clamp[data-clamped='true'],
+.cron-history-transcript .composer-human-message:hover .sticky-human-clamp,
+.cron-history-transcript .composer-human-message:focus-within .sticky-human-clamp {
+  max-height: none;
+  overflow: visible;
+  -webkit-mask-image: none;
+  mask-image: none;
+}
+
 /* The thread renders items in natural document flow (padding spacers, not
    transforms) and @tanstack/react-virtual already adjusts scrollTop itself
    when an off-screen turn is measured and its real height differs from the

@@ -347,6 +347,45 @@ class TestMessageStorage:
         assert messages[0]["content"] == "Hello"
         assert messages[1]["role"] == "assistant"
 
+    def test_get_messages_in_lineage_preserves_metadata_and_dedupes_replay(self, db):
+        db.create_session(session_id="root", source="cron")
+        db.append_message("root", role="user", content="Run the report")
+        db.end_session("root", "compression")
+
+        db.create_session(session_id="tip", source="cron", parent_session_id="root")
+        db.append_message("tip", role="user", content="Run the report")
+        db.append_message(
+            "tip",
+            role="assistant",
+            content="",
+            tool_calls=[{"id": "call-1", "function": {"name": "terminal", "arguments": "{}"}}],
+        )
+        db.append_message("tip", role="assistant", content="Complete")
+
+        messages = db.get_messages_in_lineage("root")
+
+        assert [message["role"] for message in messages] == ["user", "assistant", "assistant"]
+        assert messages[0]["timestamp"] > 0
+        assert messages[1]["tool_calls"][0]["id"] == "call-1"
+
+    def test_list_root_sessions_by_id_prefix_is_literal_and_source_scoped(self, db):
+        db.create_session(session_id="cron_job_1_new", source="cron")
+        db.create_session(session_id="cron_job_1_old", source="cron")
+        db.create_session(session_id="cron_jobX1_other", source="cron")
+        db.create_session(session_id="cron_job_1_cli", source="cli")
+        db.create_session(
+            session_id="cron_job_1_child",
+            source="cron",
+            parent_session_id="cron_job_1_new",
+        )
+
+        sessions = db.list_root_sessions_by_id_prefix("cron_job_1_", source="cron")
+
+        assert {session["id"] for session in sessions} == {
+            "cron_job_1_new",
+            "cron_job_1_old",
+        }
+
     def test_message_increments_session_count(self, db):
         db.create_session(session_id="s1", source="cli")
         db.append_message("s1", role="user", content="Hello")

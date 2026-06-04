@@ -10,6 +10,7 @@ import type {
   ConfigSchemaResponse,
   CronJob,
   CronJobCreatePayload,
+  CronJobRunsResponse,
   CronJobUpdates,
   ElevenLabsVoicesResponse,
   EnvVarInfo,
@@ -58,6 +59,8 @@ export type {
   ConfigSchemaResponse,
   CronJob,
   CronJobCreatePayload,
+  CronJobRun,
+  CronJobRunsResponse,
   CronJobSchedule,
   CronJobUpdates,
   ElevenLabsVoice,
@@ -475,6 +478,14 @@ export function getCronJobs(): Promise<CronJob[]> {
 export function getCronJob(jobId: string): Promise<CronJob> {
   return window.hermesDesktop.api<CronJob>({
     path: `/api/cron/jobs/${encodeURIComponent(jobId)}`
+  })
+}
+
+export function getCronJobRuns(jobId: string, profile?: string): Promise<CronJobRunsResponse> {
+  const profileQuery = profile ? `?profile=${encodeURIComponent(profile)}` : ''
+
+  return window.hermesDesktop.api<CronJobRunsResponse>({
+    path: `/api/cron/jobs/${encodeURIComponent(jobId)}/runs${profileQuery}`
   })
 }
 

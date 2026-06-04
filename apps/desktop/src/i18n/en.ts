@@ -497,6 +497,7 @@ export const en: Translations = {
     next: 'Next:',
     actionsFor: title => `Actions for ${title}`,
     actionsTitle: 'Cron job actions',
+    messageHistory: 'Message history',
     resume: 'Resume cron',
     pause: 'Pause cron',
     resumeTitle: 'Resume',
@@ -521,8 +522,7 @@ export const en: Translations = {
     editTitle: 'Edit cron job',
     createTitle: 'New cron job',
     editDesc: 'Update the schedule, prompt, or delivery target. Changes apply on next run.',
-    createDesc:
-      'Schedule a prompt to run automatically. Use cron syntax or a natural phrase like "every 15 minutes".',
+    createDesc: 'Schedule a prompt to run automatically. Use cron syntax or a natural phrase like "every 15 minutes".',
     nameLabel: 'Name',
     namePlaceholder: 'Morning briefing',
     promptLabel: 'Prompt',

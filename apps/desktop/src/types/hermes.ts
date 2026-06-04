@@ -415,16 +415,36 @@ export interface AnalyticsTotals {
 export interface CronJob {
   deliver?: null | string
   enabled: boolean
+  hermes_home?: string
   id: string
+  is_default_profile?: boolean
   last_error?: null | string
   last_run_at?: null | string
   name?: null | string
   next_run_at?: null | string
+  profile?: string
+  profile_name?: string
   prompt?: null | string
   schedule?: CronJobSchedule
   schedule_display?: null | string
   script?: null | string
   state?: null | string
+}
+
+export interface CronJobRun {
+  ended_at?: null | number
+  end_reason?: null | string
+  message_count: number
+  messages: SessionMessage[]
+  session_id: string
+  started_at: number
+  unavailable_media?: string[]
+}
+
+export interface CronJobRunsResponse {
+  job_id: string
+  profile: string
+  runs: CronJobRun[]
 }
 
 export interface CronJobCreatePayload {

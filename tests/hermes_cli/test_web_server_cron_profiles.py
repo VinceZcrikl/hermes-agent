@@ -50,6 +50,26 @@ def test_call_cron_for_profile_routes_storage_and_restores_globals(isolated_prof
     assert cron_jobs.OUTPUT_DIR == old_output_dir
 
 
+def test_unavailable_cron_media_keeps_existing_files_playable(tmp_path):
+    from hermes_cli import web_server
+
+    existing = tmp_path / "briefing.mp3"
+    existing.write_bytes(b"audio")
+
+    unavailable = web_server._unavailable_cron_media(
+        [
+            {
+                "content": (
+                    f"MEDIA: {existing}\n"
+                    "MEDIA: /tmp/hermes-cron-history-missing.mp3"
+                )
+            }
+        ]
+    )
+
+    assert unavailable == ["/tmp/hermes-cron-history-missing.mp3"]
+
+
 @pytest.mark.asyncio
 async def test_list_cron_jobs_all_includes_default_and_named_profiles(isolated_profiles):
     from hermes_cli import web_server
@@ -104,6 +124,76 @@ async def test_list_cron_jobs_specific_profile_filters_results(isolated_profiles
 
     assert [job["id"] for job in jobs] == [worker_job["id"]]
     assert jobs[0]["profile"] == "worker_alpha"
+
+
+@pytest.mark.asyncio
+async def test_cron_job_runs_return_full_profile_scoped_lineage(isolated_profiles):
+    from hermes_state import SessionDB
+    from hermes_cli import web_server
+
+    worker_job = web_server._call_cron_for_profile(
+        "worker_alpha",
+        "create_job",
+        prompt="worker history",
+        schedule="every 3h",
+        name="worker-history",
+    )
+    worker_home = isolated_profiles["worker_alpha"]
+    root_id = f"cron_{worker_job['id']}_20260603_120000"
+
+    db = SessionDB(worker_home / "state.db")
+    try:
+        db.create_session(session_id=root_id, source="cron")
+        db.append_message(root_id, role="user", content="Build the report")
+        db.end_session(root_id, "compression")
+
+        db.create_session(session_id="compressed-tip", source="cron", parent_session_id=root_id)
+        db.append_message("compressed-tip", role="user", content="Build the report")
+        db.append_message("compressed-tip", role="assistant", content="MEDIA: /tmp/report.png")
+        db.end_session("compressed-tip", "cron_complete")
+
+        db.create_session(session_id="cron_other-job_20260603_120000", source="cron")
+        db.append_message("cron_other-job_20260603_120000", role="assistant", content="not this job")
+        colliding_id = f"cron_{worker_job['id']}_legacy_20260603_120000"
+        db.create_session(session_id=colliding_id, source="cron")
+        db.append_message(colliding_id, role="assistant", content="prefix collision")
+    finally:
+        db.close()
+
+    result = await web_server.get_cron_job_runs(worker_job["id"], profile="worker_alpha")
+
+    assert result["profile"] == "worker_alpha"
+    assert result["job_id"] == worker_job["id"]
+    assert len(result["runs"]) == 1
+    run = result["runs"][0]
+    assert run["session_id"] == root_id
+    assert run["end_reason"] == "cron_complete"
+    assert run["message_count"] == 2
+    assert [message["content"] for message in run["messages"]] == [
+        "Build the report",
+        "MEDIA: /tmp/report.png",
+    ]
+    assert run["unavailable_media"] == ["/tmp/report.png"]
+    assert all(message["timestamp"] > 0 for message in run["messages"])
+
+
+@pytest.mark.asyncio
+async def test_cron_job_runs_without_state_db_are_empty(isolated_profiles):
+    from hermes_cli import web_server
+
+    job = web_server._call_cron_for_profile(
+        "worker_alpha",
+        "create_job",
+        prompt="worker history",
+        schedule="every 3h",
+        name="worker-history-empty",
+    )
+    state_db = isolated_profiles["worker_alpha"] / "state.db"
+
+    result = await web_server.get_cron_job_runs(job["id"], profile="worker_alpha")
+
+    assert result == {"job_id": job["id"], "profile": "worker_alpha", "runs": []}
+    assert not state_db.exists()
 
 
 @pytest.mark.asyncio

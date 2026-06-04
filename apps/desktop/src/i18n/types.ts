@@ -417,6 +417,7 @@ export interface Translations {
     next: string
     actionsFor: (title: string) => string
     actionsTitle: string
+    messageHistory: string
     resume: string
     pause: string
     resumeTitle: string
